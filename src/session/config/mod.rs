@@ -1075,6 +1075,22 @@ pub struct SessionConfig {
     )]
     pub auto_resume_on_restart: bool,
 
+    /// When a stopped terminal-mode session is opened in the web dashboard,
+    /// resume its agent automatically. On by default (the historical behavior:
+    /// opening a session reattaches, respawning a dead/absent pane via
+    /// `--resume`). Disable to open a stopped session *without* launching it:
+    /// selecting a session to read it never starts the agent; a surviving pane
+    /// is shown read-only, and the explicit Start action resumes it. Affects the
+    /// web dashboard's attach path only (`respawn_paired_if_dead` /
+    /// `respawn_container_if_dead`); the TUI is unaffected.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Resume a stopped session when opened (web)",
+        widget = "toggle",
+        category = "Web"
+    )]
+    pub resume_stopped_on_open: bool,
+
     /// Pre-assign opencode's session id before launch instead of capturing it
     /// afterward by polling opencode's SQLite store. AoE creates the session up
     /// front through a short-lived `opencode serve` HTTP call, so the id is
@@ -1644,6 +1660,7 @@ impl Default for SessionConfig {
             smart_rename_agent: String::new(),
             smart_rename_model: HashMap::new(),
             auto_resume_on_restart: true,
+            resume_stopped_on_open: true,
             opencode_preassign_session_id: false,
             mouse_capture: true,
             custom_agents: HashMap::new(),

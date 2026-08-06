@@ -111,6 +111,29 @@ pub async fn ensure_session(
         return (StatusCode::OK, Json(serde_json::json!({"status": "alive"}))).into_response();
     }
 
+    // Opening a Stopped session must not auto-launch its agent when the user
+    // turned off `resume_stopped_on_open`. `needs_restart` is true here (dead or
+    // absent pane), but for a deliberately/genuinely Stopped row that just means
+    // "not running", so signal stopped (like the read-only branch below) so the
+    // frontend shows it instead of relaunching on open. The explicit Start
+    // action (`start_session`, a separate endpoint) remains the only launcher;
+    // crash recovery is unaffected because only `Stopped` is gated (a crashed
+    // running agent is `Error`/`Running`, not `Stopped`).
+    if instance.status == crate::session::Status::Stopped
+        && !crate::session::config::profile_config::resolve_config_or_warn(&state.profile)
+            .session
+            .resume_stopped_on_open
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "resume_on_open_disabled",
+                "message": "Session is stopped. Use Start to run it (resume-on-open is off).",
+            })),
+        )
+            .into_response();
+    }
+
     if state.read_only {
         // Read-only viewers must not kill + respawn a dead session. Signal
         // the frontend so it can show "session is stopped; ask an owner to
@@ -295,6 +318,23 @@ pub async fn ensure_terminal(
                 "paired terminal pane is dead, respawning"
             );
         }
+    }
+
+    // See ensure_session: a Stopped session must not auto-launch on open when
+    // resume-on-open is off. Report stopped instead of spawning the pane.
+    if inst.status == crate::session::Status::Stopped
+        && !crate::session::config::profile_config::resolve_config_or_warn(&state.profile)
+            .session
+            .resume_stopped_on_open
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "resume_on_open_disabled",
+                "message": "Session is stopped. Use Start to run it (resume-on-open is off).",
+            })),
+        )
+            .into_response();
     }
 
     let mut inst_clone = inst;

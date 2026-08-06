@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd, appDirFor, resolveAoeBinary } from "../helpers/aoeServe";
 
 // aoe (debug build) routes tmux through an explicit `-S <socket>` and ignores
 // TMUX_TMPDIR (#2608), so inspect sessions on the harness's pinned socket.
@@ -129,6 +129,55 @@ base.describe("ensure_session restart flow", () => {
       await expect(page.getByText("Starting session...").first()).toBeHidden({
         timeout: 15_000,
       });
+    } finally {
+      await serve.stop();
+    }
+  });
+
+  base("resume_stopped_on_open=false: /ensure does NOT relaunch a Stopped session", async ({}, testInfo) => {
+    // With the setting off, opening (attaching to) a Stopped session must not
+    // auto-launch its agent: /ensure returns 409 resume_on_open_disabled and no
+    // tmux pane is created. The explicit Start action stays the only launcher.
+    const title = "e2e-resume-off";
+    const serve = await spawnAoeServe({
+      authMode: "none",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: (seedEnv) => {
+        const appDir = appDirFor(seedEnv.home, seedEnv.xdg, resolveAoeBinary());
+        mkdirSync(appDir, { recursive: true });
+        writeFileSync(join(appDir, "config.toml"), "[session]\nresume_stopped_on_open = false\n");
+        seedSessionViaAoeAdd({ title })(seedEnv);
+      },
+    });
+
+    try {
+      const sessions = await listSessions(serve.baseUrl);
+      const sessionId: string = sessions[0]!.id;
+      const tmuxName = `${serve.tmuxPrefix}${title}_${sessionId.slice(0, 8)}`;
+
+      // Deliberately stop the session so its status is Stopped (the only status
+      // the gate acts on; a crashed agent is Error/Running and is unaffected).
+      const stopRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/stop`, { method: "POST" });
+      expect(stopRes.ok).toBeTruthy();
+      await expect
+        .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.status, {
+          timeout: 10_000,
+        })
+        .toBe("Stopped");
+      expect(tmuxHasSession(serve.tmuxSocket, tmuxName)).toBe(false);
+
+      // /ensure must refuse to relaunch: 409 with the resume_on_open_disabled
+      // marker, and still no tmux pane.
+      const ensureRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" });
+      expect(ensureRes.status).toBe(409);
+      expect((await ensureRes.json()).error).toBe("resume_on_open_disabled");
+      expect(tmuxHasSession(serve.tmuxSocket, tmuxName)).toBe(false);
+
+      // The explicit Start action is unaffected: it launches the agent.
+      const startRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/start`, { method: "POST" });
+      expect(startRes.ok).toBeTruthy();
+      await expect.poll(() => tmuxHasSession(serve.tmuxSocket, tmuxName), { timeout: 10_000 }).toBe(true);
     } finally {
       await serve.stop();
     }
