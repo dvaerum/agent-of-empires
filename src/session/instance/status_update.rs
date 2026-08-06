@@ -178,15 +178,45 @@ impl Instance {
         }
     }
 
+    /// Whether the live-status poller should skip re-probing this row's tmux
+    /// state this tick.
+    ///
+    /// `Deleting`/`Creating` are genuine in-flight lifecycle states the poller
+    /// must never clobber. `Stopped` is normally terminal as well, but a
+    /// `Stopped` row whose agent pane is demonstrably alive was never really
+    /// stopped: a deliberate [`Self::stop`] kills the tmux session, so the only
+    /// way a live agent pane can coexist with a `Stopped` record is a tmux
+    /// server that outlives the daemon: an external/detached server, or a
+    /// keeper that preserves agent sessions across `aoe serve` restarts. Left
+    /// unhandled, such a row hits the early return on every poll tick, is never
+    /// re-probed, and stays stuck showing "Start" while the agent is running
+    /// and typeable. Re-probe it instead so it reconciles to its true status.
+    ///
+    /// The liveness test rides entirely on the already-fetched batch
+    /// [`tmux::PaneMetadata`] (zero extra subprocesses) and is deliberately
+    /// strict: the pane must be present, not `remain-on-exit` dead, and not a
+    /// bare shell (agent exited and tmux fell back to a shell). A transient
+    /// tmux outage yields no metadata, so it can never resurrect a genuinely
+    /// stopped row.
+    fn poller_should_skip(status: Status, metadata: Option<&tmux::PaneMetadata>) -> bool {
+        match status {
+            Status::Deleting | Status::Creating => true,
+            Status::Stopped => !metadata.is_some_and(|m| {
+                !m.pane_dead
+                    && m.pane_current_command
+                        .as_deref()
+                        .is_some_and(|cmd| !tmux::utils::is_shell_command(cmd))
+            }),
+            _ => false,
+        }
+    }
+
     pub(super) fn update_status_with_metadata_inner(
         &mut self,
         metadata: Option<&tmux::PaneMetadata>,
         resolved_name: Option<&str>,
     ) {
-        if matches!(
-            self.status,
-            Status::Stopped | Status::Deleting | Status::Creating
-        ) {
+        if Self::poller_should_skip(self.status, metadata) {
             return;
         }
 
@@ -1724,5 +1754,76 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             "one observation is all this caller gets, so its proposal decides (#3712)"
         );
         assert_eq!(once.detection.pending, None);
+    }
+
+    // --- poller_should_skip: a Stopped row whose agent pane is actually alive
+    // must be re-probed, not skipped. This is the external-keeper case: a tmux
+    // server that outlives the daemon leaves a Stopped record with a live pane,
+    // and the poller must reconcile it instead of leaving it stuck on "Start".
+
+    #[test]
+    fn poller_skips_stopped_without_a_live_pane() {
+        // Stock case: agent died on restart, no pane -> stay Stopped.
+        assert!(Instance::poller_should_skip(Status::Stopped, None));
+    }
+
+    #[test]
+    fn poller_skips_stopped_with_a_remain_on_exit_dead_pane() {
+        // aoe sessions run `remain-on-exit on`, so a dead agent leaves a dead
+        // pane on a still-Present session; that is not a live agent.
+        let mut m = agent_pane_metadata("claude", None);
+        m.pane_dead = true;
+        assert!(Instance::poller_should_skip(Status::Stopped, Some(&m)));
+    }
+
+    #[test]
+    fn poller_skips_stopped_when_pane_fell_back_to_a_shell() {
+        // Agent exited and tmux fell back to a bare shell -> not a live agent.
+        let m = agent_pane_metadata("bash", None);
+        assert!(Instance::poller_should_skip(Status::Stopped, Some(&m)));
+    }
+
+    #[test]
+    fn poller_skips_stopped_when_pane_command_unknown() {
+        let mut m = agent_pane_metadata("claude", None);
+        m.pane_current_command = None;
+        assert!(Instance::poller_should_skip(Status::Stopped, Some(&m)));
+    }
+
+    #[test]
+    fn poller_revives_stopped_with_a_live_agent_pane() {
+        // The keeper case: Stopped record, live non-dead agent pane -> do NOT
+        // skip, so live detection can reconcile it to Running/Idle.
+        assert!(!Instance::poller_should_skip(
+            Status::Stopped,
+            Some(&agent_pane_metadata("claude", None))
+        ));
+    }
+
+    #[test]
+    fn poller_always_skips_deleting_and_creating() {
+        // Genuine in-flight lifecycle states: never clobbered, even with a
+        // live pane present.
+        for s in [Status::Deleting, Status::Creating] {
+            assert!(Instance::poller_should_skip(s, None));
+            assert!(Instance::poller_should_skip(
+                s,
+                Some(&agent_pane_metadata("claude", None))
+            ));
+        }
+    }
+
+    #[test]
+    fn poller_never_skips_live_states() {
+        for s in [
+            Status::Running,
+            Status::Idle,
+            Status::Waiting,
+            Status::Error,
+            Status::Starting,
+            Status::Unknown,
+        ] {
+            assert!(!Instance::poller_should_skip(s, None));
+        }
     }
 }
