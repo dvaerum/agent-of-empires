@@ -19,7 +19,10 @@ pub(super) fn opencode_data_dir() -> Option<PathBuf> {
     )
 }
 
-pub(super) fn opencode_db_path() -> Option<PathBuf> {
+// pub(crate), not pub(super): session::capture::opencode_host_transcript_confirmed_absent
+// (a different module tree) also needs to locate opencode's on-host SQLite
+// store, and this is the one canonical implementation of that lookup.
+pub(crate) fn opencode_db_path() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("OPENCODE_DB") {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed == ":memory:" {

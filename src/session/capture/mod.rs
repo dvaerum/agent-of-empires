@@ -141,6 +141,46 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
     !transcript.is_file()
 }
 
+/// Whether `session_id` is provably NOT in opencode's on-host session store.
+///
+/// The opencode analogue of [`claude_host_transcript_confirmed_absent`]: a
+/// seeded structured-view `session/load <id>` hard-fails on a missing id, so
+/// the terminal -> structured keep-context switch must only carry an
+/// `agent_session_id` it can confirm exists. Reads opencode's SQLite store
+/// via the same [`crate::acp::acp_client::opencode::opencode_db_path`] lookup
+/// its own prompt-error recovery uses; an id present in the `session` table
+/// is exactly what `opencode --session <id>` and `session/load` resume.
+///
+/// Fail-open, matching the claude helper: if the store can't be located or
+/// read (missing, locked, schema drift, IO), return `false` ("not confirmed
+/// absent") so the caller attempts the load rather than silently dropping a
+/// live transcript. Only an authoritative, readable store with no matching
+/// row returns `true`.
+pub(crate) fn opencode_host_transcript_confirmed_absent(session_id: &str) -> bool {
+    use rusqlite::{Connection, OpenFlags};
+
+    let Some(db_path) = crate::acp::acp_client::opencode::opencode_db_path() else {
+        return false;
+    };
+    if !db_path.exists() {
+        return false;
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let _ = conn.busy_timeout(Duration::from_millis(100));
+    let Ok(mut stmt) = conn.prepare("SELECT 1 FROM session WHERE id = ?1 LIMIT 1") else {
+        return false;
+    };
+    match stmt.exists(rusqlite::params![session_id]) {
+        Ok(present) => !present,
+        Err(_) => false,
+    }
+}
+
 /// Number of leading lines and bytes scanned when locating a pi-family
 /// session header. The byte cap matters because `BufRead::lines` otherwise
 /// allocates without bound for one hostile or corrupt line.
@@ -1740,6 +1780,39 @@ mod tests {
             present,
             &[]
         ));
+    }
+
+    #[test]
+    fn opencode_host_transcript_confirmed_absent_reports_presence_and_fails_open() {
+        // Gates the opencode terminal->structured keep-context switch: the
+        // seed may only carry an agent_session_id the on-host store confirms,
+        // and must fail open (attempt the load) when the store is unreadable
+        // rather than silently dropping a live transcript.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session (id) VALUES (?1)",
+            rusqlite::params!["ses_here"],
+        )
+        .unwrap();
+        drop(conn);
+
+        {
+            let _env = crate::session::test_support::EnvGuard::set(&[("OPENCODE_DB", &db_path)]);
+            // Present in a readable store -> not confirmed absent (load succeeds).
+            assert!(!opencode_host_transcript_confirmed_absent("ses_here"));
+            // Absent from a readable store -> confirmed absent (do not seed it).
+            assert!(opencode_host_transcript_confirmed_absent("ses_missing"));
+        }
+        {
+            // Fail-open: an unreadable/missing store must not confirm absence.
+            let gone = dir.path().join("gone.db");
+            let _env = crate::session::test_support::EnvGuard::set(&[("OPENCODE_DB", &gone)]);
+            assert!(!opencode_host_transcript_confirmed_absent("ses_here"));
+        }
     }
 
     #[cfg(unix)]
