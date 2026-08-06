@@ -559,6 +559,34 @@ fn make_test_instance() -> Instance {
 // body message, not just the status).
 #[tokio::test]
 #[serial_test::serial]
+async fn ensure_session_does_not_respawn_a_structured_session() {
+    use axum::body::to_bytes;
+
+    // A structured (ACP) session has no tmux pane. `ensure_session` must
+    // refuse to respawn one: doing so mints the leftover-pane phantom that
+    // wedges the status poller after a terminal->structured switch. It
+    // returns a benign success so the client does not surface an error.
+    let mut inst = Instance::new("Vikings", "/tmp/ensure-structured");
+    inst.tool = "opencode".to_string();
+    inst.view = crate::session::View::Structured;
+    let id = inst.id.clone();
+
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let resp = ensure_session(axum::extract::State(state), axum::extract::Path(id))
+        .await
+        .into_response();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+    let msg = String::from_utf8_lossy(&body);
+    assert!(
+        msg.contains("structured"),
+        "a structured session must be reported as such, not respawned; got: {msg}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn force_smart_rename_preflight_sees_command_override_but_not_from_a_repo() {
     use axum::body::to_bytes;
 

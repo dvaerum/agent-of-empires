@@ -136,6 +136,7 @@ pub(super) fn apply_tick_status_decisions(
     prev: &std::collections::HashMap<String, crate::session::Status>,
     suppressed_ids: &std::collections::HashSet<String>,
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
+    live_worker_ids: &std::collections::HashSet<String>,
 ) {
     for inst in instances.iter_mut() {
         if suppressed_ids.contains(&inst.id) {
@@ -153,7 +154,24 @@ pub(super) fn apply_tick_status_decisions(
             }
             continue;
         }
-        if skip_tmux_decision_for_structured(inst) {
+        // A row with a live ACP worker is structured for status purposes even
+        // when its on-disk `view` still reads Terminal. That mismatch is a real
+        // window: `acp_enable` persists `view = Structured` before spawning, but
+        // the write can fail (logged, not retried) or a pre-handshake row's
+        // worker record carries no `stored_acp_session_id` yet, so
+        // `repair_structured_rows_from_live_workers` cannot heal `view` this
+        // tick. During that window a leftover/re-spawned agent pane (e.g. an
+        // opencode pane recreated by the terminal websocket) would otherwise
+        // drive tmux status detection and mint the exact phantom
+        // `skip_tmux_decision_for_structured` guards against. Gating on the live
+        // worker registry closes it at the source, independent of disk `view`.
+        if skip_tmux_decision_for_structured(inst) || live_worker_ids.contains(&inst.id) {
+            // The live-worker branch must also carry the acp-authoritative
+            // baseline onto the row, exactly as the structured branch does, so
+            // `observed_transitions` sees no phantom.
+            if let Some(live) = inst.live_status_baseline {
+                inst.status = live;
+            }
             continue;
         }
         let Some(pane_metadata) = pane_metadata else {
@@ -524,6 +542,7 @@ mod tests {
             &prev,
             &std::collections::HashSet::new(),
             Some(&std::collections::HashMap::new()),
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -543,6 +562,46 @@ mod tests {
     }
 
     #[test]
+    fn tick_skips_tmux_for_a_disk_terminal_row_with_a_live_worker() {
+        // The terminal<->structured round-trip bug. `acp_enable` persisted
+        // `view = Structured` but the disk write was lost (or the row is
+        // pre-handshake), so this row loads from disk as Terminal even though
+        // its ACP worker is live. A leftover/re-spawned agent pane would drive
+        // tmux detection to `Running` and mint a phantom `Idle -> Running`
+        // transition every tick. The live-worker set must force the tmux
+        // decision to be skipped and the live baseline carried, exactly as a
+        // disk-structured row would be, so no transition is reported.
+        let mut inst = Instance::new("acp-session", "/tmp/test");
+        // Disk view is Terminal (not structured) despite a live worker.
+        assert!(!inst.is_structured());
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        let prev = std::collections::HashMap::from([(id.clone(), Status::Idle)]);
+        let live_workers = std::collections::HashSet::from([id.clone()]);
+        let mut instances = vec![inst];
+
+        apply_tick_status_decisions(
+            &mut instances,
+            &prev,
+            &std::collections::HashSet::new(),
+            Some(&std::collections::HashMap::new()),
+            &live_workers,
+        );
+
+        assert_eq!(
+            instances[0].status,
+            Status::Idle,
+            "the live acp baseline is authoritative for a row with a live worker"
+        );
+        assert_eq!(
+            observed_transitions(&instances, &prev),
+            vec![],
+            "a disk-Terminal row with a live worker must not report a phantom \
+             transition from a leftover tmux pane"
+        );
+    }
+
+    #[test]
     fn tick_skips_a_row_that_is_new_since_the_last_snapshot() {
         // No `prev` entry means the row was created since the last tick; there
         // is no previous status to have transitioned from.
@@ -554,6 +613,7 @@ mod tests {
             &prev,
             &std::collections::HashSet::new(),
             Some(&std::collections::HashMap::new()),
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(instances[0].status, Status::Idle, "disk status stands");
@@ -580,6 +640,7 @@ mod tests {
             &prev,
             &std::collections::HashSet::from([id]),
             Some(&std::collections::HashMap::new()),
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(instances[0].status, Status::Starting);
@@ -607,6 +668,7 @@ mod tests {
                 &prev,
                 &std::collections::HashSet::new(),
                 None,
+                &std::collections::HashSet::new(),
             );
 
             assert_eq!(instances[0].status, live, "disk status was {disk:?}");
@@ -815,6 +877,7 @@ mod tests {
                 &prev,
                 &std::collections::HashSet::new(),
                 Some(&metadata),
+                &std::collections::HashSet::new(),
             );
             tracking = instances
                 .iter()

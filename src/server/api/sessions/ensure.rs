@@ -54,6 +54,24 @@ pub async fn ensure_session(
     };
     drop(instances);
 
+    // A structured (ACP) session has no tmux pane, and must never have one
+    // respawned for it: the ACP worker owns its lifecycle. Without this guard a
+    // client still holding the agent terminal open (e.g. during the brief window
+    // after a terminal->structured switch, before the client's `view` updates)
+    // POSTs /ensure, `needs_restart` sees no pane, and the agent CLI is respawned
+    // into a fresh tmux pane. That leftover pane then drives the status poller
+    // into a permanent Running<->Idle phantom oscillation. Mirror the guard
+    // `Instance::ensure_pane_ready_with_size` already applies. Report success so
+    // the frontend does not surface an error for a structured session that
+    // legitimately has no pane.
+    if instance.is_structured() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "structured"})),
+        )
+            .into_response();
+    }
+
     // Inspect tmux + make the restart decision on a blocking thread. Refresh
     // the cache first so rapid re-calls see the true current state (the
     // background status poller only refreshes every 2s).

@@ -17,6 +17,35 @@ pub(super) struct StructuredRowRepair {
 pub(super) type LiveStructuredWorkerRecord =
     (crate::process::worker_registry::WorkerRecord, String);
 
+/// Session ids of every live ACP worker, regardless of handshake progress.
+///
+/// Unlike [`live_structured_worker_records`], this does NOT filter on a
+/// non-empty `stored_acp_session_id`, so it also covers the pre-handshake
+/// window (worker spawned, `session/new`/`session/load` not yet answered). The
+/// status poller uses it to treat a row as structured-for-status even when its
+/// on-disk `view` still reads Terminal, closing the phantom-transition window
+/// that a disk-`view`-only gate leaves open. Fails open to an empty set (the
+/// tick falls back to disk `view`) when the registry can't be read.
+pub(super) fn live_structured_worker_ids() -> std::collections::HashSet<String> {
+    use crate::process::worker_registry::{self, is_record_live};
+
+    match worker_registry::list() {
+        Ok(records) => records
+            .into_iter()
+            .filter(is_record_live)
+            .map(|record| record.session_id)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                target: "server.file_watch",
+                error = %e,
+                "worker registry list failed; poller falls back to disk view this tick"
+            );
+            std::collections::HashSet::new()
+        }
+    }
+}
+
 pub(super) fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord> {
     use crate::process::worker_registry::{self, is_record_live};
 
