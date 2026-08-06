@@ -261,6 +261,85 @@ describe("useAcpSession reconnect (#1130)", () => {
   });
 });
 
+describe("useAcpSession worker-restart reconnect", () => {
+  it("redials when the worker restarts (workerState !running -> running) and the socket has gone stale", async () => {
+    // Full stop/start of a session (or a reconciler respawn that tore down
+    // the daemon relay) keeps `sessionId` unchanged, so the main connect
+    // effect never re-dials. The old socket is bound to the now-dead worker
+    // and the freshly respawned worker streams its post-load replay to a
+    // socket nobody listens on, leaving the structured view blank/stale until
+    // a manual reload. The workerState `!running -> running` edge nudges the
+    // reconnect machinery; because the socket has received no frames it is
+    // stale, so a fresh dial fires.
+    const { rerender } = renderHook(
+      ({ ws }: { ws: "absent" | "resuming" | "running" }) => useAcpSession("sess-restart", ws),
+      {
+        initialProps: { ws: "running" as "absent" | "resuming" | "running" },
+      },
+    );
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+    const first = sockets[0]!;
+    act(() => {
+      first.readyState = FakeWebSocket.OPEN;
+      first.onopen?.({} as Event);
+    });
+
+    // Worker goes down (stop): running -> absent. No new dial yet.
+    rerender({ ws: "absent" });
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+
+    // Let the socket go stale (no frames since open), then the worker comes
+    // back (start): absent -> running. Stale + restart edge -> redial.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ACP_WS_STALE_MS + 1000);
+    });
+    rerender({ ws: "running" });
+    await flushAsync();
+    expect(first.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(sockets.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does NOT redial on a live-respawn edge where the socket is still delivering frames (#3094/#1722)", async () => {
+    // The idle-auto-stop -> wake respawn keeps the daemon-side WS relay alive
+    // and still delivering frames, so the socket is fresh. Tearing it down
+    // here would drop the in-flight queue drain. The restart nudge is
+    // stale-guarded: a fresh socket that just received a frame is NOT redialed
+    // even across the !running -> running edge.
+    const { rerender } = renderHook(
+      ({ ws }: { ws: "absent" | "resuming" | "running" }) => useAcpSession("sess-live-respawn", ws),
+      {
+        initialProps: { ws: "running" as "absent" | "resuming" | "running" },
+      },
+    );
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+    const first = sockets[0]!;
+    act(() => {
+      first.readyState = FakeWebSocket.OPEN;
+      first.onopen?.({} as Event);
+    });
+    rerender({ ws: "resuming" });
+    await flushAsync();
+    // A frame arrives during the respawn (relay survived): socket is fresh.
+    act(() => {
+      first.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-live-respawn",
+          seq: 1,
+          event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
+        }),
+      } as MessageEvent);
+    });
+    rerender({ ws: "running" });
+    await flushAsync();
+    // No redial: the live socket is preserved so the drain isn't disrupted.
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+    expect(sockets).toHaveLength(1);
+  });
+});
+
 describe("useAcpSession liveness watchdog (#2287)", () => {
   // Deliver a server heartbeat frame on the captured socket.
   function heartbeat(sock: FakeSocket): void {
