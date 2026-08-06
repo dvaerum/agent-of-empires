@@ -1185,6 +1185,47 @@ export function useAcpSession(
     prevOnlineRef.current = isOnline;
   }, [isOnline]);
 
+  // React to a worker restart: when the session is stopped then started
+  // (or the reconciler respawns the ACP worker), `sessionId` is unchanged
+  // so the main connect effect (keyed on `[sessionId, ...]`) never re-dials.
+  // The old WebSocket is now pointed at a dead worker and the freshly
+  // respawned worker streams its post-load replay to a socket nobody is
+  // listening on, leaving the structured view blank/stale until a manual
+  // reload. Detect the `!running -> running` edge and force a reconnect +
+  // replay refetch, exactly as visibility/online restoration do. See #3xxx.
+  // React to a worker restart: when the session is stopped then started
+  // (or the reconciler respawns the ACP worker), `sessionId` is unchanged
+  // so the main connect effect (keyed on `[sessionId, ...]`) never re-dials.
+  // On a full stop/start the old WebSocket is dead and the freshly respawned
+  // worker streams its post-load replay to a socket nobody is listening on,
+  // leaving the structured view blank/stale until a manual reload. Nudge the
+  // reconnect machinery on the `!running -> running` edge, exactly as
+  // visibility/online restoration do.
+  //
+  // Use the stale-guarded `tryAutoReconnect`, NOT an unconditional dial: an
+  // idle-auto-stop -> wake respawn keeps the daemon-side WS relay alive and
+  // still delivering frames (seq continues), so the socket is fresh and must
+  // NOT be torn down mid-drain (that would drop the in-flight queue drain,
+  // #3094/#1722). `tryAutoReconnect` re-dials only when the socket is closed
+  // or has gone silent past the stale window, which is precisely the
+  // full-stop/start case and not the live-respawn case.
+  //
+  // The edge is folded into a monotonic counter during render (like the
+  // visibility counter above) so the effect depends on a plain number, not
+  // the `workerState` prop directly, satisfying
+  // react-you-might-not-need-an-effect/no-event-handler.
+  const prevWorkerStateRef = useRef(workerState);
+  const workerRestartCounterRef = useRef(0);
+  if (prevWorkerStateRef.current !== "running" && workerState === "running") {
+    workerRestartCounterRef.current += 1;
+  }
+  prevWorkerStateRef.current = workerState;
+  const workerRestartCounter = workerRestartCounterRef.current;
+  useEffect(() => {
+    if (workerRestartCounter === 0) return; // no restart edge yet (initial mount)
+    tryAutoReconnectRef.current();
+  }, [workerRestartCounter]);
+
   // Timestamp (ms) of the most recent applied frame. Read by the
   // "Force end turn" escape hatch in WorkingSpinner: when `turnActive`
   // is true and `Date.now() - lastActivity` exceeds the configured
