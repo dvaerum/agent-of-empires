@@ -785,9 +785,45 @@ function AcpChrome({
       {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
-        {/* Positioned wrapper so the mobile jump-to-bottom button can float at
-            the bottom of the scroll area, just above the composer. */}
+        {/* Positioned wrapper so the mobile jump-to-bottom button (below) and
+            the desktop scroll-to-bottom pill can float at the bottom of the
+            scroll area, just above the composer. */}
         <div className="relative flex min-h-0 flex-1 flex-col">
+          {/* Desktop scroll-to-bottom affordance: coarse pointers get the
+              tuned phone-specific jump-to-bottom button below instead (own
+              atBottom tracking, phone-only positioning notes). assistant-ui's
+              ScrollToBottom is a button that auto-disables (via the thread
+              viewport store) when the transcript is already pinned to the
+              bottom, so we hide it with `disabled:hidden` and only show it
+              when the user has scrolled up. Positioned as a floating pill
+              just above the composer, centered. See the request in the
+              structured view: long transcripts had no quick way back to the
+              latest message. */}
+          {!isCoarse && (
+            <ThreadPrimitive.ScrollToBottom asChild>
+              <button
+                type="button"
+                aria-label="Scroll to latest message"
+                data-testid="acp-scroll-to-bottom"
+                className="absolute bottom-3 left-1/2 z-10 -translate-x-1/2 flex h-9 w-9 items-center justify-center rounded-full border border-surface-700 bg-surface-800/90 text-text-secondary shadow-lg backdrop-blur transition-colors hover:bg-surface-700 hover:text-text-primary cursor-pointer disabled:hidden"
+              >
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M12 5v14" />
+                  <path d="m19 12-7 7-7-7" />
+                </svg>
+              </button>
+            </ThreadPrimitive.ScrollToBottom>
+          )}
           <ThreadPrimitive.Viewport
             autoScroll
             ref={viewportRef}
