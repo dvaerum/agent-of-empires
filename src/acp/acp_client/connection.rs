@@ -72,6 +72,20 @@ use super::SessionResources;
 pub(super) const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+/// After `session/load` returns, its history replay is complete on the wire:
+/// the adapter replays the whole transcript BEFORE answering `session/load`.
+/// On the direct ACP path the incoming actor processes messages sequentially
+/// and awaits the notification handler inline, so every replayed event is
+/// already enqueued on `event_tx` before the response resolves; the stream is
+/// immediately quiet. On the v2 runner path the replay events and the load
+/// response travel on two different sockets (the main byte-relay vs the control
+/// channel), so a few relayed events can still be in flight when the control
+/// response lands. Wait for this short quiet window to absorb that cross-channel
+/// lag before closing the seeded replay's phantom turns; capped by
+/// [`REPLAY_SETTLE_DRAIN_MAX`] so a stuck relay can't hold the turn open forever.
+const REPLAY_SETTLE_DRAIN_QUIET: std::time::Duration = std::time::Duration::from_millis(400);
+const REPLAY_SETTLE_DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// After a cancel, declare the adapter unresponsive if no prompt response
 /// arrives. This remains a transport-wedge defense even for adapters that
 /// normally resolve cancellation promptly.
@@ -856,6 +870,21 @@ pub(super) async fn run_connection_task<W, R>(
                     ..
                 }
             );
+            // Terminal->structured (and any Fresh/imported load that SEEDS an
+            // empty event store) replays the transcript via `session/load` with
+            // suppression OFF, so replayed `UserMessageChunk`s become
+            // `UserPromptSent` and open turns that the historical replay never
+            // closes with a `Stopped`. `turnActive` then sticks and the view
+            // wedges at "waiting for model..." forever (the original "replayed
+            // in-flight tool call wedges the turn tracker" bug). This is NOT an
+            // opencode protocol gap (a normal reattach suppresses the same
+            // replay, so it never wedges): it is specific to the seed path,
+            // where we deliberately let the replay through to populate the
+            // store. It is closed deterministically when `session/load` returns
+            // (the adapter replays the whole transcript before answering) in the
+            // `Ok(resp)` handler below, gated on `seed_history_replay`, instead
+            // of a blind quiet-timer watchdog. `arm_resume_watchdog` is a
+            // separate concern (an in-flight `Resume`, not a seeded `Fresh`).
             // Mark the adopted turn so the notification handler applies the
             // cost-marker barrier and the between-prompt watchdog emits
             // `prompt_complete` for it. Set before any turn events arrive. See #2899.
@@ -1203,6 +1232,74 @@ pub(super) async fn run_connection_task<W, R>(
                                         let _ = event_tx_for_block.send(event).await;
                                     }
                                     acp_session_id = Some(SessionId::from(stored));
+                                    // Close the seeded replay's phantom turns.
+                                    // A seed load (empty event store) ran with
+                                    // suppression OFF, so replayed user prompts
+                                    // (UserMessageChunk -> UserPromptSent) opened
+                                    // turns the historical replay never closed,
+                                    // so `turnActive` sticks ("waiting for
+                                    // model..." wedge). `session/load` has now
+                                    // returned, which means the replay is
+                                    // complete on the wire; emit one
+                                    // `Stopped { replay_settle }` (the reducer
+                                    // retires ALL outstanding prompts on that
+                                    // reason). Deterministic: armed by the load
+                                    // response, not a blind quiet-timer. The
+                                    // short drain only absorbs the v2 runner's
+                                    // cross-channel relay lag (events and the
+                                    // load response arrive on two sockets).
+                                    // Disarms if the user already sent a prompt
+                                    // (its PromptRequest owns the next Stopped)
+                                    // or another path claimed the terminal Stopped.
+                                    if seed_history_replay {
+                                        let event_tx = event_tx_for_block.clone();
+                                        let last_event_at = last_event_at.clone();
+                                        let prompt_sent_since_attach =
+                                            prompt_sent_since_attach.clone();
+                                        let terminal_claim = terminal_claim.clone();
+                                        let session_label = session_label.clone();
+                                        tokio::spawn(async move {
+                                            let deadline = tokio::time::Instant::now()
+                                                + REPLAY_SETTLE_DRAIN_MAX;
+                                            let quiet_ms =
+                                                REPLAY_SETTLE_DRAIN_QUIET.as_millis() as i64;
+                                            loop {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(100),
+                                                )
+                                                .await;
+                                                if terminal_claim.claimed()
+                                                    || prompt_sent_since_attach
+                                                        .load(Ordering::Relaxed)
+                                                {
+                                                    return;
+                                                }
+                                                let now =
+                                                    chrono::Utc::now().timestamp_millis();
+                                                let quiet = now
+                                                    - last_event_at.load(Ordering::Relaxed)
+                                                    >= quiet_ms;
+                                                if quiet
+                                                    || tokio::time::Instant::now() >= deadline
+                                                {
+                                                    if !terminal_claim.claim() {
+                                                        return;
+                                                    }
+                                                    info!(
+                                                        target: "acp.protocol",
+                                                        session = %session_label,
+                                                        "replay-settle: session/load returned; closing seeded replay phantom turns"
+                                                    );
+                                                    let _ = event_tx
+                                                        .send(Event::Stopped {
+                                                            reason: "replay_settle".into(),
+                                                        })
+                                                        .await;
+                                                    return;
+                                                }
+                                            }
+                                        });
+                                    }
                                 }
                                 Err(e) if seed_history_replay => {
                                     // Import seed (#2276): the replay may have

@@ -3611,6 +3611,13 @@
         "src/components/acp/Composer.pluginComposerActions.test.tsx"
       ],
       "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "acp.seed-replay-no-wedge",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-seed-replay-no-wedge.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     }
   ]
 }
