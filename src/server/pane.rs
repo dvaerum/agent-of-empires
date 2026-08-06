@@ -51,6 +51,29 @@ const TMUX_READY_POLL: Duration = Duration::from_millis(50);
 /// Revive a dead paired host-shell pane (or recreate a missing session) so a
 /// live-view reconnect recovers instead of hot-looping. Returns the tmux
 /// session name to capture.
+/// True when a web attach to this session must NOT respawn its agent: the
+/// session is `Stopped` and the user turned off `resume_stopped_on_open`. That
+/// makes "select a session to read it" never launch the agent; a surviving
+/// (remain-on-exit) pane is shown read-only, a fully-gone session shows the
+/// frontend's bounded retry-to-connect banner, and the explicit Start action is
+/// the only thing that (re)launches. Default config keeps resume-on-open on, so
+/// this returns false and attach behavior is unchanged.
+fn skip_respawn_for_stopped(state: &Arc<AppState>, inst: &crate::session::Instance) -> bool {
+    should_skip_respawn(
+        inst.status,
+        crate::session::config::profile_config::resolve_config_or_warn(&state.profile)
+            .session
+            .resume_stopped_on_open,
+    )
+}
+
+/// Pure decision behind [`skip_respawn_for_stopped`]: a web attach must not
+/// respawn the agent iff the session is `Stopped` AND resume-on-open is off.
+/// Extracted so the gate is unit-testable without an `AppState`.
+fn should_skip_respawn(status: crate::session::Status, resume_stopped_on_open: bool) -> bool {
+    status == crate::session::Status::Stopped && !resume_stopped_on_open
+}
+
 pub(crate) async fn respawn_paired_if_dead(
     state: &Arc<AppState>,
     id: &str,
@@ -59,6 +82,12 @@ pub(crate) async fn respawn_paired_if_dead(
 ) -> anyhow::Result<String> {
     let tmux_name =
         crate::tmux::TerminalSession::resolve_name_indexed(&inst.id, &inst.title, index);
+
+    // Opening a Stopped session must not auto-launch its agent when the user
+    // opted out of resume-on-open: return without respawning.
+    if skip_respawn_for_stopped(state, inst) {
+        return Ok(tmux_name);
+    }
 
     // Serialize concurrent reconnects for the same session so two
     // simultaneous WS attaches don't both try to recreate the pane.
@@ -125,6 +154,12 @@ pub(crate) async fn respawn_container_if_dead(
 ) -> anyhow::Result<String> {
     let tmux_name =
         crate::tmux::ContainerTerminalSession::resolve_name_indexed(&inst.id, &inst.title, index);
+
+    // See respawn_paired_if_dead: don't auto-launch a Stopped session on open
+    // when the user opted out of resume-on-open.
+    if skip_respawn_for_stopped(state, inst) {
+        return Ok(tmux_name);
+    }
 
     let lock = state.instance_lock(id).await;
     let _guard = lock.lock().await;
@@ -266,6 +301,32 @@ async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_skip_respawn_only_for_stopped_with_resume_off() {
+        use crate::session::Status;
+        // (status, resume_stopped_on_open) -> skip respawn?
+        // Only a Stopped session with resume-on-open turned OFF is read-only on
+        // open; every live/in-flight state respawns as before, and the default
+        // (resume-on-open ON) never skips, so attach behavior is unchanged.
+        let cases = [
+            (Status::Stopped, false, true),
+            (Status::Stopped, true, false),
+            (Status::Running, false, false),
+            (Status::Idle, false, false),
+            (Status::Waiting, false, false),
+            (Status::Starting, false, false),
+            (Status::Creating, false, false),
+            (Status::Error, false, false),
+        ];
+        for (status, resume, expected) in cases {
+            assert_eq!(
+                should_skip_respawn(status, resume),
+                expected,
+                "{status:?} resume_stopped_on_open={resume}"
+            );
+        }
+    }
 
     #[test]
     fn parse_pane_dead_empty_is_not_ready() {

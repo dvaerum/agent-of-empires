@@ -1101,11 +1101,31 @@ pub struct SessionConfig {
         category = "Agents"
     )]
     pub auto_resume_on_restart: bool,
-    /// Pre-assign OpenCode's session id before launch so AoE knows the exact
-    /// native identity before the first prompt. AoE creates the session through
-    /// a short-lived `opencode serve` call. This avoids guessing from the shared
-    /// SQLite store, at the cost of about two seconds on each new host launch.
-    /// Off by default. Sandboxed OpenCode automatic capture is unsupported.
+
+    /// When a stopped terminal-mode session is opened in the web dashboard,
+    /// resume its agent automatically. On by default (the historical behavior:
+    /// opening a session reattaches, respawning a dead/absent pane via
+    /// `--resume`). Disable to open a stopped session *without* launching it:
+    /// selecting a session to read it never starts the agent; a surviving pane
+    /// is shown read-only, and the explicit Start action resumes it. Affects the
+    /// web dashboard's attach path only (`respawn_paired_if_dead` /
+    /// `respawn_container_if_dead`); the TUI is unaffected.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Resume a stopped session when opened (web)",
+        widget = "toggle",
+        category = "Web"
+    )]
+    pub resume_stopped_on_open: bool,
+
+    /// Pre-assign opencode's session id before launch instead of capturing it
+    /// afterward by polling opencode's SQLite store. AoE creates the session up
+    /// front through a short-lived `opencode serve` HTTP call, so the id is
+    /// known before the first prompt (symmetric with Claude's `--session-id`).
+    /// Eliminates the post-launch capture race, at the cost of spawning a
+    /// throwaway server (~2s) on each new host opencode launch. Off by default;
+    /// the SQLite poller stays the fallback. Host sessions only, a sandboxed
+    /// agent cannot reach the loopback server.
     #[serde(default)]
     #[setting(
         label = "Pre-assign opencode session id",
@@ -1742,6 +1762,7 @@ impl Default for SessionConfig {
             smart_rename_agent: String::new(),
             smart_rename_model: HashMap::new(),
             auto_resume_on_restart: true,
+            resume_stopped_on_open: true,
             opencode_preassign_session_id: false,
             mouse_capture: true,
             host_tab_title: true,
