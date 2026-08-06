@@ -231,6 +231,32 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
     !transcript.is_file()
 }
 
+/// Whether `session_id` is provably NOT in opencode's on-host session store.
+///
+/// The opencode analogue of [`claude_host_transcript_confirmed_absent`]: a
+/// seeded structured-view `session/load <id>` hard-fails on a missing id, so
+/// the terminal -> structured keep-context switch must only carry an
+/// `agent_session_id` it can confirm exists. Reads opencode's SQLite store
+/// (the same store `try_capture_opencode_session_id` consults); an id present
+/// there is exactly what `opencode --session <id>` and `session/load` resume.
+///
+/// Fail-open, matching the claude helper: if the store can't be located or
+/// read (missing, locked, schema drift, IO), return `false` ("not confirmed
+/// absent") so the caller attempts the load rather than silently dropping a
+/// live transcript. Only an authoritative, readable store with no matching
+/// row returns `true`.
+pub(crate) fn opencode_host_transcript_confirmed_absent(session_id: &str) -> bool {
+    let Ok(db_path) = opencode_db_path() else {
+        return false;
+    };
+    let Ok(entries) = read_opencode_sessions_from_sqlite_at(&db_path) else {
+        return false;
+    };
+    !entries
+        .iter()
+        .any(|e| e.get("id").and_then(|v| v.as_str()) == Some(session_id))
+}
+
 /// Scan `~/.claude/projects/{encoded-path}/` and pick this poller's session.
 ///
 /// Tie-break:
@@ -6123,6 +6149,32 @@ mod tests {
 
         let result = opencode_db_path().unwrap();
         assert_eq!(result, custom_path);
+
+        match old {
+            Some(v) => std::env::set_var("OPENCODE_DB", v),
+            None => std::env::remove_var("OPENCODE_DB"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn opencode_host_transcript_confirmed_absent_reports_presence_and_fails_open() {
+        // Gates the opencode terminal->structured keep-context switch: the
+        // seed may only carry an agent_session_id the on-host store confirms,
+        // and must fail open (attempt the load) when the store is unreadable
+        // rather than silently dropping a live transcript.
+        let (_dir, db_path) = create_opencode_test_db(&[("ses_here", "/proj", 1)]);
+        let old = std::env::var("OPENCODE_DB").ok();
+        std::env::set_var("OPENCODE_DB", db_path.to_str().unwrap());
+
+        // Present in a readable store -> not confirmed absent (load succeeds).
+        assert!(!opencode_host_transcript_confirmed_absent("ses_here"));
+        // Absent from a readable store -> confirmed absent (do not seed it).
+        assert!(opencode_host_transcript_confirmed_absent("ses_missing"));
+        // Fail-open: an unreadable/missing store must not confirm absence.
+        let gone = db_path.parent().unwrap().join("gone.db");
+        std::env::set_var("OPENCODE_DB", gone.to_str().unwrap());
+        assert!(!opencode_host_transcript_confirmed_absent("ses_here"));
 
         match old {
             Some(v) => std::env::set_var("OPENCODE_DB", v),

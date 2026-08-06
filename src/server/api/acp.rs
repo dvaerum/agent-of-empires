@@ -1907,15 +1907,41 @@ struct StructuredSeed {
     seed_history_replay: bool,
 }
 
+/// Whether the agent's resumable transcript for `session_id` is present in its
+/// on-host store, so a seeded `session/load` will succeed. Per-agent: claude's
+/// transcript is a `~/.claude/projects/*.jsonl` file; opencode's is a row in
+/// its SQLite session store. Any other tool has no host transcript to carry, so
+/// the keep-context path never reaches here for one; return false defensively.
+/// Both underlying probes fail open (return "present") when the store can't be
+/// read, so a transient outage attempts the load rather than dropping context.
+fn host_transcript_present(
+    tool: &str,
+    project_path: &str,
+    session_id: &str,
+    host_env: &[String],
+) -> bool {
+    match tool {
+        "claude" => !crate::session::capture::claude_host_transcript_confirmed_absent(
+            project_path,
+            session_id,
+            host_env,
+        ),
+        "opencode" => {
+            !crate::session::capture::opencode_host_transcript_confirmed_absent(session_id)
+        }
+        _ => false,
+    }
+}
+
 /// Decide the seed for an `acp_enable` spawn.
 ///
 /// - An existing `acp_session_id` (a prior structured session, or a #2276
 ///   import) is loaded; history replay is seeded only when `import_pending`.
-/// - Otherwise, #2252 direction B: a claude terminal session whose resumable
-///   transcript sits in `agent_session_id` is carried into a seeded
-///   `session/load`, so switching a terminal claude session into structured
-///   view continues the same conversation. `transcript_present` gates this so a
-///   stale id does not hard-fail the seeded spawn.
+/// - Otherwise, #2252 direction B: a keep-context terminal session whose
+///   resumable transcript sits in `agent_session_id` (claude or opencode) is
+///   carried into a seeded `session/load`, so switching a terminal session into
+///   structured view continues the same conversation. `transcript_present`
+///   gates this so a stale id does not hard-fail the seeded spawn.
 /// - Failing both, the spawn starts a fresh `session/new`.
 fn resolve_structured_seed(
     tool: &str,
@@ -2114,18 +2140,45 @@ pub async fn acp_enable(
     let effort = instance.acp_effort.clone();
     let yolo_mode = instance.yolo_mode;
     let acp_mode_id = instance.acp_mode_id.clone();
-    // #2252 direction B: a claude terminal session's resumable transcript lives
-    // in `agent_session_id`, not `acp_session_id`. When present on the host (the
-    // seeded `session/load` hard-fails on a missing id), carry it into the
-    // structured spawn so the conversation continues in structured view. The
-    // in-container transcript can't be probed from the host, so sandboxed
-    // sessions attempt the load unconditionally.
+    // A "converse in the terminal, then switch to structured" flow has not
+    // captured the agent's resumable session id yet: opencode (and claude)
+    // capture it lazily on a launch/resume path, not while a session sits idle,
+    // so `agent_session_id` is still None here. Without this, the seed below
+    // falls back to session/new and DISCARDS the terminal transcript, which is
+    // the exact conversation this keep-context switch exists to preserve.
+    // Retroactively capture it now from the agent's on-host store (opencode's
+    // SQLite session table, claude's `~/.claude/projects/*.jsonl`); the read is
+    // tool-aware and returns None for agents without a resumable store. Host
+    // only: a sandboxed transcript lives inside the container and is probed by
+    // the load itself, so the seed already attempts the load unconditionally
+    // there and there is nothing to read from the host.
+    if instance.agent_session_id.is_none() && !instance.is_sandboxed() {
+        if let Some(captured) = instance.try_retroactive_capture() {
+            tracing::info!(
+                target: "acp.switch",
+                session = %id,
+                tool = %instance.tool,
+                "captured resumable session id at structured switch: {captured}"
+            );
+            instance.agent_session_id = Some(captured);
+        }
+    }
+    // #2252 direction B: a keep-context terminal session's resumable
+    // transcript lives in `agent_session_id`, not `acp_session_id`. When
+    // present on the host (the seeded `session/load` hard-fails on a missing
+    // id), carry it into the structured spawn so the conversation continues in
+    // structured view. The in-container transcript can't be probed from the
+    // host, so sandboxed sessions attempt the load unconditionally. The
+    // presence probe is per-agent: claude reads `~/.claude/projects/*.jsonl`,
+    // opencode reads its SQLite session store; both fail open (attempt the
+    // load) when the store is unreadable.
     let transcript_present = instance.is_sandboxed()
         || instance
             .agent_session_id
             .as_deref()
             .map(|sid| {
-                !crate::session::capture::claude_host_transcript_confirmed_absent(
+                host_transcript_present(
+                    &instance.tool,
                     &instance.project_path,
                     sid,
                     &instance.resolved_host_environment(),
@@ -3085,6 +3138,17 @@ mod tests {
         let s = resolve_structured_seed("claude", "claude", None, Some("agent-1"), false, true);
         assert_eq!(s.stored_acp_session_id.as_deref(), Some("agent-1"));
         assert!(s.seed_history_replay);
+
+        // Direction B, opencode: terminal opencode, no acp id, store id present.
+        // The return leg of a structured<->terminal round-trip: the id parked in
+        // agent_session_id by switch_to_terminal_keep_context is loaded back.
+        let s = resolve_structured_seed("opencode", "opencode", None, Some("ses_x"), false, true);
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("ses_x"));
+        assert!(s.seed_history_replay);
+        // opencode with the store confirmed absent: do not hard-fail the load.
+        let s = resolve_structured_seed("opencode", "opencode", None, Some("ses_x"), false, false);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
 
         // Transcript confirmed absent: do not attempt the seeded load.
         let s = resolve_structured_seed("claude", "claude", None, Some("agent-1"), false, false);
