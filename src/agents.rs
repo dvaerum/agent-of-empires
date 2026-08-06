@@ -1549,9 +1549,36 @@ pub fn terminal_tool_for_acp_agent(agent: &str) -> Option<&'static str> {
     get_agent(tool).map(|def| def.name)
 }
 
-/// Only claude qualifies: claude-agent-acp's session id is the id `claude --resume` reads.
+/// Whether switching a structured-view session back to a terminal can hand
+/// the live conversation to `<tool> --resume <id>` instead of starting fresh.
+///
+/// Requires BOTH sides of the swap to share one CLI-resumable transcript:
+///
+///   - `tool` is the terminal CLI that will run after the swap; it must
+///     resume an existing session (claude's `--resume`).
+///   - `acp_agent` is the *active* structured-view adapter (the resolved
+///     `pick_agent_for_tool` name, which `switch_acp_agent` can point away
+///     from the tool's default), whose captured `acp_session_id` must be an
+///     id that terminal CLI reads.
+///
+/// Two agents qualify today:
+///
+///   - claude: `claude-agent-acp`'s `session/new` UUID is the claude SDK
+///     session id in `~/.claude/projects/*.jsonl`, exactly what `claude
+///     --resume` reads. `claude-code` is the legacy alias for the same
+///     adapter.
+///   - opencode: `opencode acp`'s `session/new` returns the same `ses_…`
+///     store id that `opencode --session <id>` resumes and that
+///     `session/load` replays (`loadSession` is advertised in its
+///     `agentCapabilities`). Its ACP layer has no `session/delete`, so the
+///     transcript survives worker teardown regardless of the keep-context
+///     branch. Verified against opencode 1.18.4's `acp/service.ts`.
+///
+/// codex-acp and the bundled `aoe-agent` do not share a CLI-resumable store,
+/// so a session whose adapter was swapped to one of them does not qualify.
 pub fn acp_transcript_cli_resumable(tool: &str, acp_agent: &str) -> bool {
-    tool == "claude" && matches!(acp_agent, "claude" | "claude-code")
+    (tool == "claude" && matches!(acp_agent, "claude" | "claude-code"))
+        || (tool == "opencode" && acp_agent == "opencode")
 }
 
 fn configured_status_map<'a>(
@@ -1847,12 +1874,33 @@ mod tests {
     }
 
     #[test]
-    fn acp_transcript_cli_resumable_only_for_claude_pairings() {
-        assert!(acp_transcript_cli_resumable("claude", "claude"));
-        assert!(acp_transcript_cli_resumable("claude", "claude-code"));
-        assert!(!acp_transcript_cli_resumable("claude", "codex"));
-        assert!(!acp_transcript_cli_resumable("claude", "aoe-agent"));
-        assert!(!acp_transcript_cli_resumable("codex", "codex"));
+    fn acp_transcript_cli_resumable_pairings() {
+        // (tool, acp_agent, resumable). Both sides must share one
+        // CLI-resumable store: the terminal `<tool> --resume/--session <id>`
+        // and the active adapter's captured `acp_session_id`.
+        let cases = [
+            // claude: terminal `claude --resume` + claude-agent-acp share
+            // ~/.claude/projects/*.jsonl. `claude-code` is the legacy alias.
+            ("claude", "claude", true),
+            ("claude", "claude-code", true),
+            // opencode: `opencode --session` + `opencode acp` share the same
+            // `ses_…` store id (session/new returns it, session/load replays).
+            ("opencode", "opencode", true),
+            // Adapter swapped away from the tool's default (via
+            // switch_acp_agent): the acp_session_id is not resumable by the tool.
+            ("claude", "codex", false),
+            ("claude", "aoe-agent", false),
+            ("opencode", "claude", false),
+            // Non-resumable-pairing terminal tool: nothing to hand off to.
+            ("codex", "codex", false),
+        ];
+        for (tool, acp_agent, expected) in cases {
+            assert_eq!(
+                acp_transcript_cli_resumable(tool, acp_agent),
+                expected,
+                "{tool} / {acp_agent}"
+            );
+        }
     }
 
     #[test]

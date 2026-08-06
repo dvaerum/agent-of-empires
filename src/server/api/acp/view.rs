@@ -47,9 +47,38 @@ struct StructuredSeed {
     import_terminal: bool,
 }
 
+/// Whether the agent's resumable transcript for `session_id` is present in its
+/// on-host store, so a seeded `session/load` will succeed. Per-agent: claude's
+/// transcript is a `~/.claude/projects/*.jsonl` file; opencode's is a row in
+/// its SQLite session store. Any other tool has no host transcript to carry, so
+/// the keep-context path never reaches here for one; return false defensively.
+/// Both underlying probes fail open (return "present") when the store can't be
+/// read, so a transient outage attempts the load rather than dropping context.
+fn host_transcript_present(
+    tool: &str,
+    project_path: &str,
+    session_id: &str,
+    host_env: &[String],
+    claude_config_dir_override: Option<&std::path::Path>,
+) -> bool {
+    match tool {
+        "claude" => !crate::session::capture::claude_host_transcript_confirmed_absent(
+            project_path,
+            session_id,
+            host_env,
+            claude_config_dir_override,
+        ),
+        "opencode" => {
+            !crate::session::capture::opencode_host_transcript_confirmed_absent(session_id)
+        }
+        _ => false,
+    }
+}
+
 /// An existing `acp_session_id` is loaded (replayed only when importing).
-/// Otherwise a CLI-resumable terminal transcript in `agent_session_id` is
-/// carried into a seeded `session/load` (#2252), if the transcript is present.
+/// Otherwise a keep-context terminal session whose resumable transcript sits
+/// in `agent_session_id` (claude or opencode) is carried into a seeded
+/// `session/load` (#2252), if the transcript is present.
 fn resolve_structured_seed(
     tool: &str,
     acp_agent: &str,
@@ -342,7 +371,7 @@ async fn deferred_enable_request(
     exclusion: crate::acp::sandbox::LaunchExclusion,
 ) -> Option<Result<(SpawnRequest, crate::acp::supervisor::ResumeReservation), String>> {
     let session_id = expected.id.as_str();
-    let instance = find_instance(state, session_id).await.filter(|row| {
+    let mut instance = find_instance(state, session_id).await.filter(|row| {
         row.is_structured()
             && row.terminal_handoff.is_none()
             && row.launch_is_finalized()
@@ -350,15 +379,47 @@ async fn deferred_enable_request(
             && row.source_profile == expected.source_profile
             && row.ensure_startable().is_ok()
     })?;
+    // A "converse in the terminal, then switch to structured" flow has not
+    // captured the agent's resumable session id yet: opencode (and claude)
+    // capture it lazily on a launch/resume path, not while a session sits idle,
+    // so `agent_session_id` is still None here. Without this, the seed below
+    // falls back to session/new and DISCARDS the terminal transcript, which is
+    // the exact conversation this keep-context switch exists to preserve.
+    // Retroactively capture it now from the agent's on-host store (opencode's
+    // SQLite session table, claude's `~/.claude/projects/*.jsonl`); the read is
+    // tool-aware and returns None for agents without a resumable store. Host
+    // only: a sandboxed transcript lives inside the container and is probed by
+    // the load itself, so the seed already attempts the load unconditionally
+    // there and there is nothing to read from the host.
+    if instance.agent_session_id.is_none() && !instance.is_sandboxed() {
+        if let Some(observation) = instance
+            .try_retroactive_capture_in(crate::session::CaptureStorage::Profiles(&state.file_watch))
+            .ok()
+            .flatten()
+        {
+            let captured = observation.sid;
+            tracing::info!(
+                target: "acp.switch",
+                session = %session_id,
+                tool = %instance.tool,
+                "captured resumable session id at structured switch: {captured}"
+            );
+            instance.agent_session_id = Some(captured);
+        }
+    }
     let claude_store_pin = instance.selected_claude_store_pin();
     let resume_sid = selected_conversation
         .as_ref()
         .map(|(sid, _)| sid.as_str())
         .or(instance.agent_session_id.as_deref());
+    // The presence probe is per-agent: claude reads
+    // `~/.claude/projects/*.jsonl`, opencode reads its SQLite session store;
+    // both fail open (attempt the load) when the store is unreadable.
     let transcript_present = instance.is_sandboxed()
         || resume_sid
             .map(|sid| {
-                !crate::session::capture::claude_host_transcript_confirmed_absent(
+                host_transcript_present(
+                    &instance.tool,
                     &instance.project_path,
                     sid,
                     &instance.resolved_host_environment(),
@@ -3596,6 +3657,31 @@ mod tests {
                 "claude",
                 None,
                 Some("agent-1"),
+                false,
+                false,
+                None,
+                false,
+            ),
+            // Direction B, opencode: terminal opencode, no acp id, store id
+            // present. The return leg of a structured<->terminal round-trip:
+            // the id parked in agent_session_id by switch_to_terminal_keep_context
+            // is loaded back.
+            (
+                "opencode",
+                "opencode",
+                None,
+                Some("ses_x"),
+                false,
+                true,
+                Some("ses_x"),
+                true,
+            ),
+            // opencode with the store confirmed absent: do not hard-fail the load.
+            (
+                "opencode",
+                "opencode",
+                None,
+                Some("ses_x"),
                 false,
                 false,
                 None,

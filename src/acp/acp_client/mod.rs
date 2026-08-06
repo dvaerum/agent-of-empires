@@ -17,7 +17,7 @@ mod fs_handlers;
 mod handshake;
 mod lifecycle;
 mod list;
-mod opencode;
+pub(crate) mod opencode;
 mod pending;
 mod permission_handlers;
 mod plan;
