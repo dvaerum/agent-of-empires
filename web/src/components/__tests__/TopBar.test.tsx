@@ -110,3 +110,55 @@ describe("TopBar", () => {
     expect(onOpenTips).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("TopBar fullscreen toggle", () => {
+  const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+  const exitFullscreen = vi.fn().mockResolvedValue(undefined);
+
+  function setFullscreenApi(opts: { enabled: boolean; element?: Element | null }) {
+    Object.defineProperty(document, "fullscreenEnabled", {
+      value: opts.enabled,
+      configurable: true,
+    });
+    Object.defineProperty(document, "fullscreenElement", {
+      value: opts.element ?? null,
+      configurable: true,
+    });
+    document.documentElement.requestFullscreen = requestFullscreen as never;
+    document.exitFullscreen = exitFullscreen as never;
+  }
+
+  afterEach(() => {
+    cleanup();
+    requestFullscreen.mockClear();
+    exitFullscreen.mockClear();
+    Object.defineProperty(document, "fullscreenEnabled", { value: false, configurable: true });
+    Object.defineProperty(document, "fullscreenElement", { value: null, configurable: true });
+  });
+
+  it("offers Full screen and requests fullscreen when supported and not fullscreen", () => {
+    setFullscreenApi({ enabled: true, element: null });
+    const { getByRole } = renderTopBar();
+    fireEvent.click(getByRole("button", { name: "More options" }));
+    fireEvent.click(getByRole("menuitem", { name: "Full screen" }));
+    expect(requestFullscreen).toHaveBeenCalledTimes(1);
+    expect(exitFullscreen).not.toHaveBeenCalled();
+  });
+
+  it("offers Exit full screen and exits when already fullscreen", () => {
+    setFullscreenApi({ enabled: true, element: document.documentElement });
+    const { getByRole } = renderTopBar();
+    fireEvent.click(getByRole("button", { name: "More options" }));
+    fireEvent.click(getByRole("menuitem", { name: "Exit full screen" }));
+    expect(exitFullscreen).toHaveBeenCalledTimes(1);
+    expect(requestFullscreen).not.toHaveBeenCalled();
+  });
+
+  it("hides the item where the Fullscreen API is unsupported", () => {
+    setFullscreenApi({ enabled: false });
+    const { getByRole, queryByRole } = renderTopBar();
+    fireEvent.click(getByRole("button", { name: "More options" }));
+    expect(queryByRole("menuitem", { name: "Full screen" })).toBeNull();
+    expect(queryByRole("menuitem", { name: "Exit full screen" })).toBeNull();
+  });
+});
