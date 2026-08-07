@@ -666,6 +666,13 @@
       "components": ["web/src/components/TopBar.tsx"]
     },
     {
+      "id": "app-shell.fullscreen-toggle",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/TopBar.test.tsx"],
+      "components": ["web/src/components/TopBar.tsx", "web/src/hooks/useFullscreen.ts"]
+    },
+    {
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",
