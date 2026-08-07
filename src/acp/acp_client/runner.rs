@@ -58,6 +58,28 @@ pub(super) fn take_injected_fresh_handshake_failure() -> bool {
         .is_ok()
 }
 
+/// Executable that launches the detached `__acp-runner`, honoring an operator
+/// override.
+///
+/// `AOE_ACP_RUNNER_EXE`, when set and non-empty, replaces the daemon's own
+/// binary as the launcher. This is a general extension seam: an operator can
+/// interpose a wrapper that re-homes the runner into its own systemd
+/// scope/cgroup (so a `systemctl restart aoe-web` no longer kills structured
+/// sessions), adds `nice`/`ionice`, or instruments it, WITHOUT patching aoe.
+/// The wrapper receives the exact `__acp-runner …` argv, plus the path of the
+/// real aoe binary to re-exec via `AOE_ACP_RUNNER_REAL_EXE` (see the spawn
+/// site). Unset or empty falls back to the daemon binary itself, i.e. today's
+/// behavior.
+fn resolve_runner_exe(
+    current_exe: &std::path::Path,
+    override_var: Option<&std::ffi::OsStr>,
+) -> std::path::PathBuf {
+    match override_var {
+        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => current_exe.to_path_buf(),
+    }
+}
+
 /// Spawn the `aoe __acp-runner` shim as a detached process. The
 /// runner owns the agent subprocess and outlives the daemon. We retain
 /// no `Child` handle here; once the runner is up, the daemon talks to
@@ -71,6 +93,9 @@ pub(super) fn spawn_runner_detached(
 ) -> Result<u32, AcpError> {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
+    let runner_override = std::env::var_os("AOE_ACP_RUNNER_EXE");
+    let runner_exe = resolve_runner_exe(&current_exe, runner_override.as_deref());
+    let runner_overridden = runner_exe != current_exe;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
         .map_err(|e| AcpError::Spawn(format!("log path: {e}")))?;
     if let Some(parent) = log_path.parent() {
@@ -141,7 +166,7 @@ pub(super) fn spawn_runner_detached(
             (None, None) => (config.spec.command.clone(), Vec::new()),
         };
 
-    let mut cmd = tokio::process::Command::new(&current_exe);
+    let mut cmd = tokio::process::Command::new(&runner_exe);
     cmd.arg("__acp-runner")
         .arg("--socket")
         .arg(socket_path)
@@ -204,6 +229,20 @@ pub(super) fn spawn_runner_detached(
     #[cfg(debug_assertions)]
     if let Ok(interval) = std::env::var("AOE_ACP_WATCHDOG_POLL_MS") {
         cmd.env("AOE_ACP_WATCHDOG_POLL_MS", interval);
+    }
+    if runner_overridden {
+        // An operator override launcher is in use (AOE_ACP_RUNNER_EXE). Hand it
+        // what a wrapper needs to re-home and re-exec the real runner: the true
+        // aoe binary, plus the user session bus so a `systemd-run --user`
+        // wrapper can reach the user manager (env_clear wiped these, and they
+        // are not in ALWAYS_FORWARD_ENV). Gated on the override so the default
+        // spawn env is byte-for-byte unchanged.
+        cmd.env("AOE_ACP_RUNNER_REAL_EXE", &current_exe);
+        for name in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
     }
     // Trusted `Config.environment`, destined for the adapter only. It rides
     // one reserved carrier key rather than the runner's own environment
@@ -293,7 +332,7 @@ pub(super) fn spawn_runner_detached(
         target: "acp.protocol.spawn",
         session = %session_id,
         socket = %socket_path.display(),
-        runner = %current_exe.display(),
+        runner = %runner_exe.display(),
         agent = %config.spec.command,
         resolved = %spawn_command,
         "spawning detached structured view runner"
@@ -317,4 +356,33 @@ pub(super) fn spawn_runner_detached(
         let _ = child.wait().await;
     });
     Ok(pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_runner_exe_prefers_nonempty_override() {
+        let current = std::path::Path::new("/nix/store/abc/bin/aoe");
+        let cases: [(Option<&std::ffi::OsStr>, &str); 3] = [
+            // Unset -> the daemon's own binary (today's behavior).
+            (None, "/nix/store/abc/bin/aoe"),
+            // Empty is treated as unset, not as an empty path, so a blank
+            // AOE_ACP_RUNNER_EXE can't silently break the spawn.
+            (Some(std::ffi::OsStr::new("")), "/nix/store/abc/bin/aoe"),
+            // Set + non-empty -> the operator's launcher wrapper.
+            (
+                Some(std::ffi::OsStr::new("/etc/aoe/runner-scope-launcher")),
+                "/etc/aoe/runner-scope-launcher",
+            ),
+        ];
+        for (override_var, expected) in cases {
+            assert_eq!(
+                resolve_runner_exe(current, override_var),
+                std::path::PathBuf::from(expected),
+                "override={override_var:?}"
+            );
+        }
+    }
 }
