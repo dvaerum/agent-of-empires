@@ -28,6 +28,7 @@ function renderTopBar(
     activeWorkspace?: Workspace;
     activeSession?: SessionResponse | null;
     onOpenTips?: () => void;
+    onEnterImmersive?: () => void;
   } = {},
 ) {
   return render(
@@ -50,6 +51,7 @@ function renderTopBar(
       isDevBuild={overrides.isDevBuild ?? false}
       onOpenTips={overrides.onOpenTips ?? vi.fn()}
       onGoDashboard={vi.fn()}
+      onEnterImmersive={overrides.onEnterImmersive}
       sidebarColumnVisible={false}
       rightColumnVisible={false}
     />,
@@ -108,6 +110,20 @@ describe("TopBar", () => {
     fireEvent.click(getByRole("button", { name: "More options" }));
     fireEvent.click(getByRole("menuitem", { name: "Tips" }));
     expect(onOpenTips).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows Immersive mode only when onEnterImmersive is provided, and fires it", () => {
+    // Absent without the handler (e.g. non-shell / test contexts).
+    const bare = renderTopBar();
+    fireEvent.click(bare.getByRole("button", { name: "More options" }));
+    expect(bare.queryByRole("menuitem", { name: "Immersive mode" })).toBeNull();
+    cleanup();
+    // Present + wired when the shell passes the handler.
+    const onEnterImmersive = vi.fn();
+    const { getByRole } = renderTopBar({ onEnterImmersive });
+    fireEvent.click(getByRole("button", { name: "More options" }));
+    fireEvent.click(getByRole("menuitem", { name: "Immersive mode" }));
+    expect(onEnterImmersive).toHaveBeenCalledTimes(1);
   });
 });
 

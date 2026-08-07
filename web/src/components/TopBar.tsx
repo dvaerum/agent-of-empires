@@ -39,6 +39,9 @@ interface Props {
    *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
   onOpenTips: () => void;
   onGoDashboard: () => void;
+  /** Enter immersive mode (hide the top bar + sidebar). Optional so the TopBar
+   *  renders without it in tests / non-shell contexts. */
+  onEnterImmersive?: () => void;
   /** When true (desktop, sidebar open, not in a full-width settings/projects
    *  view), the header's left zone widens to match the sidebar column and the
    *  divider runs vertically through the header instead of a bottom border, so
@@ -69,6 +72,7 @@ export function TopBar({
   isDevBuild,
   onOpenTips,
   onGoDashboard,
+  onEnterImmersive,
   sidebarColumnVisible,
   rightColumnVisible,
 }: Props) {
@@ -87,6 +91,11 @@ export function TopBar({
         onClick: toggleFullscreen,
       });
     }
+    // Immersive mode hides the app chrome via layout only, so it works
+    // everywhere (including iPhone, where the Fullscreen API does not).
+    if (onEnterImmersive) {
+      items.push({ label: "Immersive mode", onClick: onEnterImmersive });
+    }
     items.push({ label: "About", onClick: onOpenAbout });
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
@@ -100,6 +109,7 @@ export function TopBar({
     fullscreenSupported,
     isFullscreen,
     toggleFullscreen,
+    onEnterImmersive,
   ]);
 
   // The left zone only borrows the sidebar's width while that column is
