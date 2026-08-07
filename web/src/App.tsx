@@ -102,6 +102,8 @@ import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocu
 import { clearMobileKeyboardProxyInput, deliverMobileKeyboardProxyInput } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
+import { useImmersive } from "./hooks/useImmersive";
+import { ImmersiveExitButton } from "./components/ImmersiveExitButton";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
@@ -727,6 +729,7 @@ function AppContent({
   // before a pending consent modal.
   const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
+  const immersive = useImmersive();
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
   const [keyboardProxy, setKeyboardProxy] = useState<HTMLTextAreaElement | null>(null);
   const setKeyboardProxyRef = useCallback((element: HTMLTextAreaElement | null) => {
@@ -2172,13 +2175,19 @@ function AppContent({
   return (
     <AcpPrefsProvider value={acpPrefs}>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-        {/* Wrapped unconditionally, not behind the `headerCollapsible`
-            ternary: swapping the element type at this position would remount
-            `TopBar` (and reset its overflow menu) every time the boundary
-            flips, e.g. opening settings on a phone. An expanded region is a
+        {immersive.active && <ImmersiveExitButton onExit={immersive.exit} />}
+        {/* Wrapped unconditionally, not behind either the `headerCollapsible`
+            or the immersive ternary: swapping the element type at this
+            position would remount `TopBar` (and reset its overflow menu)
+            every time either boundary flips, e.g. opening settings on a
+            phone or entering/leaving immersive mode. An expanded region is a
             `1fr` grid row around a fixed-height bar, so the wrapper is inert
-            for every view that cannot collapse. */}
-        <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+            for every view that cannot collapse; immersive collapses it the
+            same way headerCollapsed does. */}
+        <CollapsibleRegion
+          id="conversation-header"
+          collapsed={(headerCollapsible && headerCollapsed) || immersive.active}
+        >
           <TopBar
             activeWorkspace={activeWorkspace}
             activeSession={activeSession ?? null}
@@ -2198,6 +2207,7 @@ function AppContent({
             isDevBuild={isDebugBuild(serverAbout)}
             onOpenTips={tips.open}
             onGoDashboard={handleGoDashboard}
+            onEnterImmersive={immersive.enter}
             sidebarColumnVisible={!showSettings && sidebarOpen}
             rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
           />
@@ -2211,7 +2221,7 @@ function AppContent({
             absolutely positioned at the top-right, and hanging it off the bar
             puts it on top of the update banner's dismiss button (same corner),
             which then cannot be tapped at all. */}
-        {headerCollapsible && (
+        {headerCollapsible && !immersive.active && (
           <ChromeCollapseHandle
             edge="top"
             collapsed={headerCollapsed}
@@ -2224,7 +2234,7 @@ function AppContent({
         )}
 
         <div className="flex flex-1 min-h-0">
-          {!showSettings && (
+          {!showSettings && !immersive.active && (
             <WorkspaceSidebar
               groups={sidebarGroups}
               nestedGroups={nestedGroups}

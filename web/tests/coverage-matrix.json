@@ -673,6 +673,17 @@
       "components": ["web/src/components/TopBar.tsx", "web/src/hooks/useFullscreen.ts"]
     },
     {
+      "id": "app-shell.immersive-mode",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/TopBar.test.tsx", "src/hooks/__tests__/useImmersive.test.ts"],
+      "components": [
+        "web/src/components/TopBar.tsx",
+        "web/src/hooks/useImmersive.ts",
+        "web/src/components/ImmersiveExitButton.tsx"
+      ]
+    },
+    {
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",
