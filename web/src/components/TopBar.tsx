@@ -11,6 +11,7 @@ import { useWebSettings } from "../hooks/useWebSettings";
 import type { AttentionBadgeColors } from "../lib/attentionBadgeColors";
 import { StrokeIcon } from "./icons";
 import { Tooltip } from "./Tooltip";
+import { useFullscreen } from "../hooks/useFullscreen";
 
 interface Props {
   activeWorkspace: Workspace | undefined;
@@ -84,16 +85,35 @@ export function TopBar({
   sidebarColumnVisible,
   rightColumnVisible,
 }: Props) {
+  const { supported: fullscreenSupported, isFullscreen, toggle: toggleFullscreen } = useFullscreen();
   const overflowItems = useMemo<OverflowItem[]>(() => {
     const items: OverflowItem[] = [
       { label: "Help", onClick: onOpenHelp },
       { label: "Show tutorial", onClick: onStartTutorial },
       { label: "Tips", onClick: onOpenTips },
-      { label: "About", onClick: onOpenAbout },
     ];
+    // Browser Fullscreen API toggle; hidden where unsupported (e.g. iPhone
+    // Safari) so it is never a dead menu item.
+    if (fullscreenSupported) {
+      items.push({
+        label: isFullscreen ? "Exit full screen" : "Full screen",
+        onClick: toggleFullscreen,
+      });
+    }
+    items.push({ label: "About", onClick: onOpenAbout });
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
-  }, [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
+  }, [
+    onOpenHelp,
+    onStartTutorial,
+    onOpenTips,
+    onOpenAbout,
+    onLogout,
+    loginRequired,
+    fullscreenSupported,
+    isFullscreen,
+    toggleFullscreen,
+  ]);
 
   // The left zone only borrows the sidebar's width while that column is visible, so the compact rail only crowds
   // the wordmark in that combination.
