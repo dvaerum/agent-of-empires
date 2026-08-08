@@ -367,7 +367,7 @@ pub struct Supervisor<S: BroadcastSink> {
     /// reservation, two concurrent callers both pass the empty-`workers`
     /// check and race to insert. The RAII `ResumeReservation` guard
     /// removes the entry on success, error, or panic.
-    pending_resumes: Arc<std::sync::Mutex<HashMap<String, ResumeKind>>>,
+    pending_resumes: Arc<std::sync::Mutex<HashMap<String, (ResumeKind, std::time::Instant)>>>,
     /// Session ids whose in-flight resume (spawn or attach) should
     /// bail out instead of inserting the freshly-built `WorkerHandle`.
     /// Set by `shutdown` when it observes a session that's in
@@ -450,7 +450,7 @@ pub struct Supervisor<S: BroadcastSink> {
 /// leave a phantom reservation that blocks every future resume for
 /// that session AND keeps the UI stuck on "Resuming…".
 pub(crate) struct ResumeReservation {
-    pending: Arc<std::sync::Mutex<HashMap<String, ResumeKind>>>,
+    pending: Arc<std::sync::Mutex<HashMap<String, (ResumeKind, std::time::Instant)>>>,
     session_id: String,
     /// Wakes any `wait_for_worker` parked on the supervisor's
     /// `worker_notify`. Cloned from the supervisor at construction
@@ -1546,13 +1546,64 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         kind: ResumeKind,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
-        let workers = self.workers.lock().await;
+        let mut workers = self.workers.lock().await;
         if workers.contains_key(session_id) {
-            return Ok(ResumeReservationOutcome::AlreadyPresent);
+            // Liveness gate: a registered worker whose detached runner is dead
+            // (PID gone or socket gone) must not wedge the session into
+            // `AlreadyRunning` forever. This happens when a runner is killed
+            // before it is established (e.g. an `aoe serve` restart during the
+            // spawn window, or an out-of-band kill) and its in-memory handle is
+            // never evicted; every later enable/reconnect then fails and the
+            // caller downgrades to a fresh `session/new`, silently dropping the
+            // resumable context. Only a genuinely live runner (an on-disk
+            // record that `is_record_live`) stays `AlreadyPresent`; a dead one
+            // is evicted here so the caller reserves and respawns (resuming the
+            // stored acp_session_id) instead of wedging.
+            let live = crate::process::worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .as_ref()
+                .map(crate::process::worker_registry::is_record_live)
+                .unwrap_or(false);
+            if live {
+                return Ok(ResumeReservationOutcome::AlreadyPresent);
+            }
+            if let Some(stale) = workers.remove(session_id) {
+                stale.drain_task.abort();
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "evicted a dead-but-registered structured view worker; \
+                     respawning instead of returning AlreadyRunning",
+                );
+            }
         }
         let mut pending = lock_recover(&self.pending_resumes);
-        if pending.contains_key(session_id) {
-            return Ok(ResumeReservationOutcome::AlreadyPresent);
+        let reservation_started = pending.get(session_id).map(|(_, started)| *started);
+        if let Some(started) = reservation_started {
+            // A genuine in-flight resume settles within the socket timeout
+            // (~30s) and drops its RAII reservation. A reservation older than
+            // that with no live runner is a leaked phantom that would block
+            // every future resume and pin the UI on "Resuming"; evict it so
+            // this caller reserves and respawns instead of wedging on
+            // AlreadyRunning. Conservative on purpose: an in-flight spawn (age
+            // under the threshold) or one with a live runner stays present.
+            const STALE_RESERVATION: std::time::Duration = std::time::Duration::from_secs(45);
+            let live = crate::process::worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .as_ref()
+                .map(crate::process::worker_registry::is_record_live)
+                .unwrap_or(false);
+            if started.elapsed() <= STALE_RESERVATION || live {
+                return Ok(ResumeReservationOutcome::AlreadyPresent);
+            }
+            pending.remove(session_id);
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                "evicted a stale (leaked) resume reservation; reserving a fresh resume",
+            );
         }
         match kind {
             ResumeKind::Spawn => {
@@ -1575,7 +1626,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .unwrap_or(0);
                 let pending_spawn_count = pending
                     .values()
-                    .filter(|k| matches!(k, ResumeKind::Spawn))
+                    .filter(|(k, _)| matches!(k, ResumeKind::Spawn))
                     .count();
                 let combined = workers.len() + registry_count + pending_spawn_count;
                 if combined >= self.max_concurrent_workers as usize {
@@ -1593,7 +1644,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 // `max_concurrent_workers`, leaving the session unmanaged.
             }
         }
-        pending.insert(session_id.to_string(), kind);
+        pending.insert(session_id.to_string(), (kind, std::time::Instant::now()));
         Ok(ResumeReservationOutcome::Reserved(ResumeReservation {
             pending: Arc::clone(&self.pending_resumes),
             session_id: session_id.to_string(),
@@ -4473,29 +4524,74 @@ cursor-acp-bridge = "agent acp"
         assert!(matches!(result, Err(SupervisorError::UnknownAgent(_))));
     }
 
+    /// `#[serial]` because it mutates `HOME` / `XDG_CONFIG_HOME` to point the
+    /// worker registry at a temp dir (needed for the liveness gate below).
     #[tokio::test]
+    #[serial_test::serial]
     async fn double_spawn_returns_already_running() {
-        let sink = VecSink::new();
-        let sup = Supervisor::new(sink);
-        // Inject a fake worker by inserting directly into the workers
-        // map. We can't actually spawn without a real agent binary
-        // here; this verifies the guard path.
-        let mut workers = sup.workers.lock().await;
-        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-1".into()));
-        let drain = tokio::spawn(async {});
-        workers.insert(
-            "s-1".into(),
-            WorkerHandle {
-                client: Arc::new(client),
-                drain_task: drain,
-                restart_history: vec![Instant::now()],
-                kind: WorkerKind::Stdio,
-            },
-        );
-        drop(workers);
+        // Root under /tmp, not $TMPDIR: on macOS the latter is deep enough
+        // that <app_dir>/acp-workers/<id>.sock blows past the sun_path limit.
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-double-spawn-", "/tmp").unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized via `#[serial]`; restored before returning.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
 
-        let result = sup
-            .spawn(SpawnRequest {
+        // A stand-in runner: the begin_resume liveness gate (#1748 self-heal)
+        // now checks the on-disk worker registry before honoring an
+        // in-memory `workers` entry, so a fake `WorkerHandle` with no
+        // corresponding live record would otherwise be evicted-and-respawned
+        // instead of hitting the AlreadyRunning this test asserts.
+        // `process_group(0)` makes the child its own group leader so nothing
+        // here can signal the test process itself.
+        use std::os::unix::process::CommandExt as _;
+        let mut fake_runner = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn stand-in runner");
+
+        let result = async {
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink);
+            // Inject a fake worker by inserting directly into the workers
+            // map. We can't actually spawn without a real agent binary
+            // here; this verifies the guard path.
+            let mut workers = sup.workers.lock().await;
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-1".into()));
+            let drain = tokio::spawn(async {});
+            workers.insert(
+                "s-1".into(),
+                WorkerHandle {
+                    client: Arc::new(client),
+                    drain_task: drain,
+                    restart_history: vec![Instant::now()],
+                    kind: WorkerKind::Stdio,
+                },
+            );
+            drop(workers);
+
+            let socket = crate::process::worker_registry::socket_path_for("s-1").unwrap();
+            std::fs::write(&socket, b"").unwrap();
+            let record = crate::process::worker_registry::WorkerRecord::new(
+                "s-1".into(),
+                fake_runner.id(),
+                socket,
+                "claude-code".into(),
+                "claude-code".into(),
+                std::env::temp_dir(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            crate::process::worker_registry::save(&record).unwrap();
+
+            sup.spawn(SpawnRequest {
                 session_id: "s-1".into(),
                 agent: "claude-code".into(),
                 tool: "claude-code".into(),
@@ -4513,7 +4609,23 @@ cursor-acp-bridge = "agent acp"
                 acp_mode_id: None,
                 agent_command_override: None,
             })
-            .await;
+            .await
+        }
+        .await;
+
+        let _ = fake_runner.kill();
+        let _ = fake_runner.wait();
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
         assert!(matches!(result, Err(SupervisorError::AlreadyRunning(_))));
     }
 
@@ -6031,12 +6143,12 @@ cursor-acp-bridge = "agent acp"
     /// during runtime shutdown or in synchronous teardown).
     #[test]
     fn resume_reservation_drop_is_synchronous_no_runtime_needed() {
-        let pending: Arc<std::sync::Mutex<HashMap<String, ResumeKind>>> =
+        let pending: Arc<std::sync::Mutex<HashMap<String, (ResumeKind, std::time::Instant)>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
-        pending
-            .lock()
-            .unwrap()
-            .insert("s-sync-drop".into(), ResumeKind::Spawn);
+        pending.lock().unwrap().insert(
+            "s-sync-drop".into(),
+            (ResumeKind::Spawn, std::time::Instant::now()),
+        );
 
         let reservation = ResumeReservation {
             pending: Arc::clone(&pending),
@@ -6058,12 +6170,12 @@ cursor-acp-bridge = "agent acp"
     /// drop-time panic that would crash the runtime worker.
     #[test]
     fn resume_reservation_drop_recovers_from_poisoned_mutex() {
-        let pending: Arc<std::sync::Mutex<HashMap<String, ResumeKind>>> =
+        let pending: Arc<std::sync::Mutex<HashMap<String, (ResumeKind, std::time::Instant)>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
-        pending
-            .lock()
-            .unwrap()
-            .insert("s-poison".into(), ResumeKind::Spawn);
+        pending.lock().unwrap().insert(
+            "s-poison".into(),
+            (ResumeKind::Spawn, std::time::Instant::now()),
+        );
 
         let p_clone = Arc::clone(&pending);
         let _ = std::panic::catch_unwind(|| {
@@ -6095,10 +6207,10 @@ cursor-acp-bridge = "agent acp"
         let sink = VecSink::new();
         let sup = Arc::new(Supervisor::new(sink));
 
-        sup.pending_resumes
-            .lock()
-            .unwrap()
-            .insert("s-notify".into(), ResumeKind::Spawn);
+        sup.pending_resumes.lock().unwrap().insert(
+            "s-notify".into(),
+            (ResumeKind::Spawn, std::time::Instant::now()),
+        );
         let reservation = ResumeReservation {
             pending: Arc::clone(&sup.pending_resumes),
             session_id: "s-notify".into(),
@@ -6223,10 +6335,10 @@ cursor-acp-bridge = "agent acp"
         // but no WorkerHandle yet. This is the exact window where
         // the bug used to bite, shutdown returned UnknownSession
         // and the late spawn completion installed an orphan.
-        sup.pending_resumes
-            .lock()
-            .unwrap()
-            .insert("s-cancel".into(), ResumeKind::Spawn);
+        sup.pending_resumes.lock().unwrap().insert(
+            "s-cancel".into(),
+            (ResumeKind::Spawn, std::time::Instant::now()),
+        );
         assert!(sup.is_running("s-cancel").await);
 
         // The new shutdown contract: success (Ok(())), and the id is
@@ -6257,10 +6369,10 @@ cursor-acp-bridge = "agent acp"
     async fn shutdown_during_pending_attach_marks_for_cancellation() {
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
-        sup.pending_resumes
-            .lock()
-            .unwrap()
-            .insert("s-attach-cancel".into(), ResumeKind::Attach);
+        sup.pending_resumes.lock().unwrap().insert(
+            "s-attach-cancel".into(),
+            (ResumeKind::Attach, std::time::Instant::now()),
+        );
         sup.shutdown("s-attach-cancel")
             .await
             .expect("shutdown of pending attach should succeed");
@@ -6314,10 +6426,10 @@ cursor-acp-bridge = "agent acp"
     #[allow(clippy::await_holding_lock)]
     async fn shutdown_holds_workers_lock_across_cancelled_resumes_seed() {
         let sup = Arc::new(Supervisor::new(VecSink::new()));
-        sup.pending_resumes
-            .lock()
-            .unwrap()
-            .insert("s-race".into(), ResumeKind::Spawn);
+        sup.pending_resumes.lock().unwrap().insert(
+            "s-race".into(),
+            (ResumeKind::Spawn, std::time::Instant::now()),
+        );
 
         let cancelled_guard = sup.cancelled_resumes.lock().unwrap();
 
@@ -6411,10 +6523,10 @@ cursor-acp-bridge = "agent acp"
 
         // The registry-terminate branch only seeds the breadcrumb when
         // `pending_has_it` is true, mirroring the writer at line 2264.
-        sup.pending_resumes
-            .lock()
-            .unwrap()
-            .insert("s-registry-race".into(), ResumeKind::Spawn);
+        sup.pending_resumes.lock().unwrap().insert(
+            "s-registry-race".into(),
+            (ResumeKind::Spawn, std::time::Instant::now()),
+        );
 
         let cancelled_guard = sup.cancelled_resumes.lock().unwrap();
 
@@ -6829,14 +6941,14 @@ cursor-acp-bridge = "agent acp"
 
         assert_eq!(sup.worker_state("s-spawn").await, AcpWorkerState::Absent);
 
-        sup.pending_resumes
-            .lock()
-            .unwrap()
-            .insert("s-spawn".into(), ResumeKind::Spawn);
-        sup.pending_resumes
-            .lock()
-            .unwrap()
-            .insert("s-attach".into(), ResumeKind::Attach);
+        sup.pending_resumes.lock().unwrap().insert(
+            "s-spawn".into(),
+            (ResumeKind::Spawn, std::time::Instant::now()),
+        );
+        sup.pending_resumes.lock().unwrap().insert(
+            "s-attach".into(),
+            (ResumeKind::Attach, std::time::Instant::now()),
+        );
 
         assert_eq!(sup.worker_state("s-spawn").await, AcpWorkerState::Resuming);
         assert_eq!(sup.worker_state("s-attach").await, AcpWorkerState::Resuming);
@@ -6864,11 +6976,11 @@ cursor-acp-bridge = "agent acp"
         sup.pending_resumes
             .lock()
             .unwrap()
-            .insert("s-a".into(), ResumeKind::Spawn);
+            .insert("s-a".into(), (ResumeKind::Spawn, std::time::Instant::now()));
         sup.pending_resumes
             .lock()
             .unwrap()
-            .insert("s-b".into(), ResumeKind::Spawn);
+            .insert("s-b".into(), (ResumeKind::Spawn, std::time::Instant::now()));
 
         // A third spawn must fail the capacity check rather than slip
         // through the pre-insert window.
@@ -6919,10 +7031,10 @@ cursor-acp-bridge = "agent acp"
         let sink = VecSink::new();
         let sup = Supervisor::with_capacity(sink, 1);
 
-        sup.pending_resumes
-            .lock()
-            .unwrap()
-            .insert("s-attach".into(), ResumeKind::Attach);
+        sup.pending_resumes.lock().unwrap().insert(
+            "s-attach".into(),
+            (ResumeKind::Attach, std::time::Instant::now()),
+        );
 
         // With max=1 and one Attach pending, a fresh spawn for a
         // different id must still pass the capacity check; the spawn
