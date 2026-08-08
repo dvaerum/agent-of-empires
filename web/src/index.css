@@ -647,3 +647,15 @@ select:focus-visible,
      while the keyboard is open, so the keyboard-lift math is unaffected. */
   padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
 }
+
+/* Full app height. iOS standalone under-reports 100dvh / innerHeight /
+   visualViewport by the top safe-area, leaving a gray gap at the bottom. Pin the
+   app root to the real viewport edges with position:fixed + inset:0: a fixed box
+   constrained by top:0 + bottom:0 fills the full fixed viewport (empirically
+   taller than innerHeight in iOS standalone). No explicit height, or it would
+   over-constrain the box and CSS would ignore bottom:0, reinstating the gap.
+   Desktop/browser fills the viewport identically. */
+.app-height {
+  position: fixed;
+  inset: 0;
+}

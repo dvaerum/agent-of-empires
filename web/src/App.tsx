@@ -2159,7 +2159,7 @@ function AppContent({
   // before caps.cityhall settles. Early return (matching the other loading
   // gates) rather than a wrapper so the shell markup stays unindented. See #7.
   if (!serverAboutLoaded) {
-    return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+    return <div className="app-height bg-surface-900 safe-area-inset" />;
   }
 
   // The header collapse is a phone affordance for the conversation view only:
@@ -2174,7 +2174,7 @@ function AppContent({
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-      <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
+      <div className="app-height flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         {immersive.active && <ImmersiveExitButton onExit={immersive.exit} />}
         {/* Wrapped unconditionally, not behind either the `headerCollapsible`
             or the immersive ternary: swapping the element type at this
