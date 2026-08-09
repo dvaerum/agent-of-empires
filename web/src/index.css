@@ -177,6 +177,10 @@
 
 html {
   height: 100dvh;
+  /* The root background propagates to the whole viewport canvas, so this keeps
+     any area the app root doesn't cover (e.g. an iOS standalone bottom strip)
+     painted in the app surface instead of bare black canvas. */
+  background: var(--color-surface-900);
   overflow: hidden;
   overscroll-behavior: none;
   overscroll-behavior-x: none;
@@ -655,7 +659,24 @@ select:focus-visible,
    taller than innerHeight in iOS standalone). No explicit height, or it would
    over-constrain the box and CSS would ignore bottom:0, reinstating the gap.
    Desktop/browser fills the viewport identically. */
+/* Full app height. Base: position:fixed + inset:0 fills the fixed viewport. On
+   iOS standalone that fixed viewport is the INTERACTIVE viewport (~793 on a
+   notched iPhone 14 Pro), NOT the 852 screen, so plain inset:0 leaves a bare
+   strip below. Pinning to 100lvh (852) instead paints the whole screen but
+   pushes content into the 793..852 band the device clips behind the home
+   indicator (that was the "Send button cut off" bug). So in standalone: PAINT to
+   100lvh, but INSET the content by (100lvh - 100svh) so the composer stays inside
+   the interactive viewport and is never clipped. svh (static small viewport)
+   avoids the keyboard-driven dvh shifts. */
 .app-height {
   position: fixed;
   inset: 0;
+}
+@media (display-mode: standalone) {
+  .app-height {
+    bottom: auto;
+    height: 100vh;
+    height: 100lvh;
+    padding-bottom: calc(100lvh - 100svh);
+  }
 }
