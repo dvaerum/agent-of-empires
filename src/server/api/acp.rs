@@ -1939,6 +1939,30 @@ fn resolve_structured_seed(
             };
         }
     }
+    // A previously-structured session whose live `acp_session_id` was lost (e.g. a
+    // resume cancelled mid-flight by a daemon/worker restart) still has its ACP
+    // session id persisted in `agent_session_id`. When the structured agent owns
+    // the tool's native adapter (`tool == acp_agent`) and can resume
+    // (`resume_strategy != Unsupported`), `session/load` that id instead of
+    // cold-starting a brand-new empty conversation. The agent's own `session/load`
+    // returns history, so no seeded replay; a stale id fails the load and the
+    // spawn falls back to fresh, so this is safe. Without this, non-claude agents
+    // (e.g. opencode) silently lose their conversation on a churned resume; claude
+    // stays on the transcript path above via `acp_transcript_cli_resumable`.
+    if tool == acp_agent
+        && !crate::agents::acp_transcript_cli_resumable(tool, acp_agent)
+        && !matches!(
+            crate::agents::get_agent(tool).map(|a| &a.resume_strategy),
+            None | Some(crate::agents::ResumeStrategy::Unsupported),
+        )
+    {
+        if let Some(id) = agent_session_id.filter(|s| !s.trim().is_empty()) {
+            return StructuredSeed {
+                stored_acp_session_id: Some(id.to_string()),
+                seed_history_replay: import_pending,
+            };
+        }
+    }
     StructuredSeed {
         stored_acp_session_id: None,
         seed_history_replay: import_pending,
@@ -3091,11 +3115,26 @@ mod tests {
         assert_eq!(s.stored_acp_session_id, None);
         assert!(!s.seed_history_replay);
 
-        // Non-resumable pairing (adapter swapped away, or non-claude): fresh.
+        // Adapter swapped away (tool != agent): the persisted id belongs to the
+        // old tool, not the current agent, so stay fresh.
         let s = resolve_structured_seed("claude", "codex", None, Some("agent-1"), false, true);
         assert_eq!(s.stored_acp_session_id, None);
         assert!(!s.seed_history_replay);
+
+        // Native non-claude adapter with a persisted ACP id + a resumable
+        // strategy: session/load it instead of cold-starting an empty session
+        // (regression guard for the churned-resume context loss that hit
+        // opencode). No seeded replay; the agent's own session/load returns
+        // history. Applies to opencode / codex / gemini alike.
+        let s = resolve_structured_seed("opencode", "opencode", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("agent-1"));
+        assert!(!s.seed_history_replay);
         let s = resolve_structured_seed("codex", "codex", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("agent-1"));
+        assert!(!s.seed_history_replay);
+
+        // Unknown tool (no agent def, resume_strategy indeterminate): stay fresh.
+        let s = resolve_structured_seed("nope", "nope", None, Some("agent-1"), false, true);
         assert_eq!(s.stored_acp_session_id, None);
         assert!(!s.seed_history_replay);
 
