@@ -50,6 +50,32 @@ function snapshot(model: string, effort: string) {
   return configOptionsUpdated([modelOption(model), effortOption(effort)]);
 }
 
+function longModelOption(count: number) {
+  return {
+    id: "model",
+    name: "Model",
+    category: "model",
+    current_value: "model-1",
+    options: Array.from({ length: count }, (_, i) => ({
+      value: `model-${i + 1}`,
+      name: `Model ${i + 1}`,
+    })),
+  };
+}
+
+function longModeOption(count: number) {
+  return {
+    id: "mode",
+    name: "Agent Modes",
+    category: "mode",
+    current_value: "mode-1",
+    options: Array.from({ length: count }, (_, i) => ({
+      value: `mode-${i + 1}`,
+      name: `Mode ${i + 1}`,
+    })),
+  };
+}
+
 test("user sees model and effort pickers after the adapter advertises config options", async ({ page }) => {
   const mock = await mockAcpSession(page, {
     title: "ui-pickers-render",
@@ -144,4 +170,71 @@ test("rejected switch renders a dismissable non-blocking notice", async ({ page 
   // Manual dismiss removes the notice.
   await notice.getByRole("button", { name: "Dismiss notice" }).click();
   await expect(notice).toHaveCount(0);
+});
+
+test("long model list stays in the viewport and scrolls on short screens", async ({ page }) => {
+  // A phone-height viewport (e.g. with the software keyboard up): the model
+  // dropdown opens upward and used to extend past the top of the viewport,
+  // clipping the first rows with no way to scroll them. The menu must cap
+  // its height to the space above the trigger and scroll instead.
+  await page.setViewportSize({ width: 320, height: 568 });
+  const mock = await mockAcpSession(page, {
+    title: "ui-pickers-long-model",
+    initialEvents: [configOptionsUpdated([longModelOption(20)])],
+  });
+  await openStructuredSession(page, mock);
+
+  const modelChip = page.getByTestId("config-option-model");
+  await expect(modelChip).toBeVisible({ timeout: 15_000 });
+  await modelChip.click();
+
+  const menu = page.getByRole("menu");
+  await expect(menu).toBeVisible();
+
+  // The menu is a scroll container that fits the viewport above the trigger.
+  const fitsViewport = () => menu.boundingBox().then((box) => Boolean(box && box.y >= 0 && box.y + box.height <= 568));
+  await expect.poll(fitsViewport).toBe(true);
+  expect(await menu.evaluate((el) => getComputedStyle(el).overflowY)).toBe("auto");
+
+  // The first row is reachable without scrolling...
+  const first = page.getByTestId("config-option-model-value-model-1");
+  await expect.poll(() => first.boundingBox().then((b) => Boolean(b && b.y >= 0 && b.y <= 568))).toBe(true);
+
+  // ...and the last row becomes reachable once the menu is scrolled to the bottom.
+  const last = page.getByTestId("config-option-model-value-model-20");
+  await menu.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect.poll(() => last.boundingBox().then((b) => Boolean(b && b.y >= 0 && b.y <= 568))).toBe(true);
+});
+
+test("long mode list stays in the viewport and scrolls on short screens", async ({ page }) => {
+  // Same clipping hazard as the model dropdown: the composer's mode menu
+  // also opens upward and used to extend past the top of the viewport.
+  await page.setViewportSize({ width: 320, height: 568 });
+  const mock = await mockAcpSession(page, {
+    title: "ui-pickers-long-mode",
+    initialEvents: [configOptionsUpdated([longModeOption(20)])],
+  });
+  await openStructuredSession(page, mock);
+
+  const modePicker = page.locator('[data-tour="acp-mode-picker"]');
+  await expect(modePicker).toBeVisible({ timeout: 15_000 });
+  await modePicker.getByRole("button").click();
+
+  const menu = page.getByRole("menu");
+  await expect(menu).toBeVisible();
+
+  const fitsViewport = () => menu.boundingBox().then((box) => Boolean(box && box.y >= 0 && box.y + box.height <= 568));
+  await expect.poll(fitsViewport).toBe(true);
+  expect(await menu.evaluate((el) => getComputedStyle(el).overflowY)).toBe("auto");
+
+  const first = page.getByRole("menuitem", { name: "Mode 1", exact: true });
+  await expect.poll(() => first.boundingBox().then((b) => Boolean(b && b.y >= 0 && b.y <= 568))).toBe(true);
+
+  const last = page.getByRole("menuitem", { name: "Mode 20", exact: true });
+  await menu.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect.poll(() => last.boundingBox().then((b) => Boolean(b && b.y >= 0 && b.y <= 568))).toBe(true);
 });

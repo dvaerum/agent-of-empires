@@ -34,6 +34,11 @@ interface Props {
 const MODEL_LABEL_MAX = 24;
 const EFFORT_SEGMENTED_MAX_COUNT = 5;
 const EFFORT_SEGMENTED_MAX_TOTAL_LABEL_LEN = 40;
+/** Cap for upward-opening picker menus (model / mode): the menu is
+ *  clamped to the space above the trigger so a long list never extends
+ *  past the top of the viewport, where it would be clipped and
+ *  unreachable. 256px matches the slash-popover's `max-h-64`. */
+export const MENU_MAX_HEIGHT = 256;
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
@@ -85,6 +90,11 @@ interface SubProps {
 
 function ModelDropdown({ option, pending, onSelect }: SubProps) {
   const [open, setOpen] = useState(false);
+  // The menu opens upward; cap its height to the space above the trigger so
+  // a long model list never extends past the top of the viewport, where it
+  // would be unreachable (clipped, not scrollable). Re-measured on each open
+  // in case the layout (keyboard, orientation) moved the composer.
+  const [menuMaxHeight, setMenuMaxHeight] = useState<number>(MENU_MAX_HEIGHT);
   const ref = useRef<HTMLDivElement | null>(null);
   const menuId = `config-option-menu-${option.id}`;
   const current = option.options.find((o) => o.value === option.current_value) ?? option.options[0];
@@ -106,11 +116,22 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
     };
   }, [open]);
 
+  const toggle = () => {
+    if (!open) {
+      const el = ref.current;
+      if (el) {
+        const available = el.getBoundingClientRect().top - 4;
+        setMenuMaxHeight(Math.max(64, Math.min(MENU_MAX_HEIGHT, available)));
+      }
+    }
+    setOpen((v) => !v);
+  };
+
   return (
     <div ref={ref} className="relative">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggle}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
@@ -129,8 +150,9 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
       {open && (
         <div
           id={menuId}
-          className="absolute bottom-full left-0 z-30 mb-1 w-64 overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
+          className="absolute bottom-full left-0 z-30 mb-1 w-64 overflow-y-auto rounded-md border border-surface-700 bg-surface-850 shadow-xl"
           role="menu"
+          style={{ maxHeight: menuMaxHeight }}
         >
           <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
             {option.name}

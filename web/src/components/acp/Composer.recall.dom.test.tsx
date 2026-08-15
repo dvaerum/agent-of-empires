@@ -19,7 +19,7 @@ vi.mock("./useFilesIndex", () => ({
   useFilesIndex: () => ({ files: [] }),
   fuzzyFilter: <T,>(items: T[]) => items,
 }));
-vi.mock("./SessionConfigControls", () => ({ SessionConfigControls: () => null }));
+vi.mock("./SessionConfigControls", () => ({ SessionConfigControls: () => null, MENU_MAX_HEIGHT: 256 }));
 vi.mock("./SwitchAgentModal", () => ({ SwitchAgentModal: () => null }));
 vi.mock("../../hooks/useMobileKeyboard", () => ({ useMobileKeyboard: () => ({ keyboardOpen: false }) }));
 vi.mock("../../hooks/useFocusTerminalTarget", () => ({ useFocusTerminalTarget: () => {} }));

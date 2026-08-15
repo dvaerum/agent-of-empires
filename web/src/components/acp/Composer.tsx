@@ -20,7 +20,7 @@ import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-r
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { replaceSlashCommand } from "./slashCompletion";
-import { SessionConfigControls } from "./SessionConfigControls";
+import { MENU_MAX_HEIGHT, SessionConfigControls } from "./SessionConfigControls";
 import { Tooltip } from "../Tooltip";
 import { ProvenanceBadge } from "../ProvenanceBadge";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
@@ -1520,6 +1520,9 @@ function ModePicker({
 }: ModePickerProps) {
   const profile = useAgentProfile();
   const [open, setOpen] = useState(false);
+  // See MENU_MAX_HEIGHT in SessionConfigControls: re-measured on each open
+  // in case the layout moved the composer.
+  const [menuMaxHeight, setMenuMaxHeight] = useState<number>(MENU_MAX_HEIGHT);
   const ref = useRef<HTMLDivElement | null>(null);
 
   // Resolve which channel drives the picker (config option vs ACP
@@ -1552,6 +1555,17 @@ function ModePicker({
     };
   }, [open]);
 
+  const toggle = () => {
+    if (!open) {
+      const el = ref.current;
+      if (el) {
+        const available = el.getBoundingClientRect().top - 4;
+        setMenuMaxHeight(Math.max(64, Math.min(MENU_MAX_HEIGHT, available)));
+      }
+    }
+    setOpen((v) => !v);
+  };
+
   // Nothing advertised on an agent without a claude-style taxonomy:
   // render no picker rather than a phantom vocabulary it would reject.
   if (!channel) return null;
@@ -1575,7 +1589,7 @@ function ModePicker({
     <div ref={ref} {...tourAnchor(TOUR_ANCHORS.modePicker)} className="relative">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggle}
         title={current.description || `Mode: ${current.name}`}
         className={[
           "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium",
@@ -1588,8 +1602,9 @@ function ModePicker({
       </button>
       {open && (
         <div
-          className="absolute bottom-full left-0 z-30 mb-1 w-56 overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
+          className="absolute bottom-full left-0 z-30 mb-1 w-56 overflow-y-auto rounded-md border border-surface-700 bg-surface-850 shadow-xl"
           role="menu"
+          style={{ maxHeight: menuMaxHeight }}
         >
           <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
             {channel.label}
