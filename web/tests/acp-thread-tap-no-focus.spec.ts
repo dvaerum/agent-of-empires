@@ -2,10 +2,10 @@ import { test, expect } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 
-// Tapping anywhere in the structured-view transcript focuses the composer and
-// brings up the soft keyboard on touch (#2243). On a coarse pointer the
-// composer is NOT auto-focused on mount (#1178), so a tap on the transcript is
-// the only thing that should move focus into it here.
+// A tap on the structured-view transcript must NOT focus the composer: on a
+// coarse pointer that would pop the soft keyboard over the transcript, and the
+// composer is only meant to focus when tapped directly. The live terminal keeps
+// tap-to-focus (#2243) plus its keyboard FAB, so the toggle stays there.
 
 test.use({ ...devices["iPhone 13"] });
 
@@ -79,14 +79,14 @@ async function openStructuredSession(page: Page) {
   await expect(page.getByTestId("structured-view-root")).toBeVisible({ timeout: 10000 });
 }
 
-test.describe("Structured-view tap-to-focus (#2243)", () => {
-  test("tapping the transcript focuses the composer", async ({ page }) => {
+test.describe("Structured-view transcript tap keeps the composer unfocused", () => {
+  test("tapping the transcript does not focus the composer or pop the keyboard", async ({ page }) => {
     await setup(page);
     await openStructuredSession(page);
 
     const composer = page.getByPlaceholder(/Send a message/);
     await expect(composer).toBeVisible();
-    // Start from an unfocused composer so the tap is what moves focus into it.
+    // Start from an unfocused composer; the tap must not move focus into it.
     await composer.blur();
     await expect(composer).not.toBeFocused();
 
@@ -94,6 +94,6 @@ test.describe("Structured-view tap-to-focus (#2243)", () => {
     // starter-prompt buttons) so the tap lands on non-interactive content.
     await page.getByTestId("acp-viewport").click({ position: { x: 8, y: 8 } });
 
-    await expect(composer).toBeFocused();
+    await expect(composer).not.toBeFocused();
   });
 });

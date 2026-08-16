@@ -1933,11 +1933,11 @@
       ]
     },
     {
-      "id": "acp.thread-tap-focus",
+      "id": "acp.thread-tap-no-focus",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-thread-tap-focus.spec.ts", "src/components/acp/threadTapFocus.test.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/threadTapFocus.ts"]
+      "specs": ["tests/acp-thread-tap-no-focus.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.composer-queue-recall",

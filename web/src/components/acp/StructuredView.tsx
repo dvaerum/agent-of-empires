@@ -59,8 +59,6 @@ import { AttentionChime } from "./AttentionChime";
 import { useRespawnSession, type RespawnState } from "../../hooks/useRespawnSession";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
-import { dispatchFocusTerminal } from "../../lib/terminalFocus";
-import { shouldFocusComposerOnThreadTap } from "./threadTapFocus";
 import type {
   Approval,
   ActivityRow,
@@ -396,21 +394,6 @@ function AcpChrome({
     });
   }, []);
 
-  // Tap anywhere in the transcript focuses the composer and brings up the soft
-  // keyboard on touch, mirroring the live terminal's tap-to-focus (#2243). The
-  // bus dispatch runs the Composer's focus listener synchronously, so iOS still
-  // sees the focus inside the user-gesture call stack. Coarse-only: desktop
-  // already auto-focuses the composer, and a fine-pointer transcript click is
-  // usually a selection. Interactive targets and live selections are skipped by
-  // the guard.
-  const isCoarse = useIsCoarsePointer();
-  const onThreadTap = (e: React.MouseEvent) => {
-    const sel = window.getSelection();
-    if (shouldFocusComposerOnThreadTap({ isCoarse, target: e.target, hasSelection: !!sel && !sel.isCollapsed })) {
-      dispatchFocusTerminal("composer");
-    }
-  };
-
   // When an async older-history fetch settles without growing the
   // transcript (empty page, error), clear the anchor so it can't latch
   // onto later unrelated growth. See #2236.
@@ -572,7 +555,6 @@ function AcpChrome({
           ref={viewportRef}
           data-testid="acp-viewport"
           className="flex-1 overflow-x-hidden overflow-y-auto"
-          onClick={onThreadTap}
         >
           <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
             <ThreadPrimitive.Empty>
