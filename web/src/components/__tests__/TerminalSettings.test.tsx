@@ -82,11 +82,12 @@ describe("TerminalSettings localStorage contract", () => {
     expect(input.value).toBe("Fira Code");
   });
 
-  it("autoOpenKeyboard checkbox writes the boolean flag", () => {
+  it("autoOpenKeyboard checkbox writes the boolean flag (off by default)", () => {
     const { container } = render(<TerminalSettings />);
     const checkbox = container.querySelectorAll("input[type=checkbox]")[0] as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
     fireEvent.click(checkbox);
-    expect(readStored().autoOpenKeyboard).toBe(false);
+    expect(readStored().autoOpenKeyboard).toBe(true);
   });
 
   it("sidebar side select writes sidebarSide into aoe-web-settings", () => {
