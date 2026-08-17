@@ -41,7 +41,7 @@ describe("TerminalSettings localStorage contract", () => {
     const { container } = render(<TerminalSettings />);
     const checkboxes = container.querySelectorAll("input[type=checkbox]");
     fireEvent.click(checkboxes[0]!);
-    expect(readStored().autoOpenKeyboard).toBe(false);
+    expect(readStored().autoOpenKeyboard).toBe(true);
     fireEvent.click(checkboxes[1]!);
     expect(readStored().persistentTerminals).toBe(true);
     fireEvent.click(checkboxes[2]!);
@@ -54,6 +54,43 @@ describe("TerminalSettings localStorage contract", () => {
       (o) => (o as HTMLOptionElement).value,
     );
     expect(options).toEqual(["JetBrains Mono", "MesloLGS NF"]);
+  });
+
+  it("reflects a stored terminalFontFamily on mount", () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ terminalFontFamily: "Fira Code" }));
+    const { container } = render(<TerminalSettings />);
+    const input = container.querySelector("#terminal-font-family") as HTMLInputElement;
+    expect(input.value).toBe("Fira Code");
+  });
+
+  it("autoOpenKeyboard checkbox writes the boolean flag (off by default)", () => {
+    const { container } = render(<TerminalSettings />);
+    const checkbox = container.querySelectorAll("input[type=checkbox]")[0] as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    fireEvent.click(checkbox);
+    expect(readStored().autoOpenKeyboard).toBe(true);
+  });
+
+  it("sidebar side select writes sidebarSide into aoe-web-settings", () => {
+    const { container } = render(<TerminalSettings />);
+    const select = container.querySelector("#sidebar-side") as HTMLSelectElement;
+    expect(select.value).toBe("left");
+    fireEvent.change(select, { target: { value: "right" } });
+    expect(readStored().sidebarSide).toBe("right");
+  });
+
+  it("reflects a stored sidebarSide on mount", () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ sidebarSide: "right" }));
+    const { container } = render(<TerminalSettings />);
+    const select = container.querySelector("#sidebar-side") as HTMLSelectElement;
+    expect(select.value).toBe("right");
+  });
+
+  it("persistent terminals checkbox writes the beta flag", () => {
+    const { container } = render(<TerminalSettings />);
+    const checkbox = container.querySelectorAll("input[type=checkbox]")[1] as HTMLInputElement;
+    fireEvent.click(checkbox);
+    expect(readStored().persistentTerminals).toBe(true);
   });
 
   it("persistent terminal limit input writes a clamped number", () => {

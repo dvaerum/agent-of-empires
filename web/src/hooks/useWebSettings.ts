@@ -17,6 +17,11 @@ export interface WebSettings {
   structuredMobileFontSize: number;
   structuredDesktopFontSize: number;
   terminalFontFamily: string;
+  /** Pop the soft keyboard automatically when selecting a session on a
+   *  coarse pointer (see handleSelectSession/handleSelectWorkspace in
+   *  App.tsx). Off by default: popping the keyboard on every session switch
+   *  was disruptive for monitoring-first workflows; the keyboard FAB / a
+   *  direct tap on the input still bring it up on demand. */
   autoOpenKeyboard: boolean;
   persistentTerminals: boolean;
   maxPersistentTerminals: number;
@@ -45,7 +50,7 @@ function getDefaults(): WebSettings {
     structuredMobileFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
     structuredDesktopFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
     terminalFontFamily: "",
-    autoOpenKeyboard: true,
+    autoOpenKeyboard: false,
     persistentTerminals: false,
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
     persistentStructuredViews: false,
