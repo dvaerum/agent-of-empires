@@ -66,7 +66,8 @@ export function TerminalSettings() {
             <div>
               <div className="text-[13px] text-text-secondary">Auto-open keyboard on mobile</div>
               <p className="text-[11px] text-text-muted mt-1">
-                Open the soft keyboard when you select a session. Turn off for monitoring-first workflows.
+                Open the soft keyboard when you select a session. Off by default; turn on if you want to start typing
+                immediately after switching sessions.
               </p>
             </div>
             <input

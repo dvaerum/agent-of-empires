@@ -297,6 +297,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "session.select-no-auto-keyboard",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/session-select-no-auto-keyboard.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/hooks/useWebSettings.ts"]
+    },
+    {
       "id": "terminal.mobile-live-wheel-forward-e2e",
       "kind": "mocked-playwright",
       "risk": "high",
