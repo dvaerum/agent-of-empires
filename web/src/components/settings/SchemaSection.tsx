@@ -129,6 +129,17 @@ function renderField(
           mono={widget.mono}
         />
       );
+    case "password":
+      return (
+        <TextField
+          key={d.field}
+          label={d.label}
+          description={description}
+          value={typeof raw === "string" ? raw : ""}
+          onChange={(v) => save(v)}
+          password
+        />
+      );
     case "number":
       return (
         <NumberField

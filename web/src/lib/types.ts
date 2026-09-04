@@ -620,6 +620,8 @@ export type SettingsWidget =
   | { kind: "slider"; min: number; max: number; step: number }
   | { kind: "select"; options: SettingsSelectOption[] }
   | { kind: "list" }
+  /** A secret string, rendered as a masked password input (API v14). */
+  | { kind: "password" }
   /** A select whose options the host resolves at render time (API v9). */
   | { kind: "dynamic_select"; source: SettingsOptionSource; depends_on?: string[] }
   /** A repeatable list of structured items (API v9). One level deep. */
@@ -638,13 +640,15 @@ export type SettingsWidget =
 
 /** Host option source a `dynamic_select` draws from (API v9). Serialized
  *  snake_case, posted back verbatim to the resolver endpoint. */
-export type SettingsOptionSource = "acp_agents" | "acp_models" | "acp_modes" | "projects" | "groups";
+export type SettingsOptionSource = "acp_agents" | "acp_models" | "acp_modes" | "projects" | "groups" | "sessions";
 
 /** The widget of one `object_list` item field (API v9). A subset of
  *  {@link SettingsWidget} with no object-list variant (non-recursive). */
 export type SettingsObjectFieldWidget =
   | { kind: "toggle" }
   | { kind: "text"; multiline?: boolean; mono?: boolean }
+  /** A secret string, rendered as a masked password input (API v14). */
+  | { kind: "password" }
   | { kind: "number"; min?: number; max?: number }
   | { kind: "select"; options: SettingsSelectOption[] }
   | { kind: "dynamic_select"; source: SettingsOptionSource; depends_on?: string[] }
