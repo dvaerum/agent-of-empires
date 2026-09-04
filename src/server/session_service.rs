@@ -1377,16 +1377,31 @@ impl SessionService {
         let lock = self.instance_lock(id).await;
         let _guard = lock.lock().await;
 
-        let profile = {
+        let (profile, changed) = {
             let mut instances = self.instances.write().await;
             match instances.iter_mut().find(|i| i.id == id) {
                 Some(inst) => {
-                    inst.session_mcp_servers = servers.clone();
-                    inst.source_profile.clone()
+                    // Compare the incoming set to the persisted one BEFORE
+                    // overwriting, so an unchanged re-assertion is a no-op.
+                    let changed = mcp_set_changed(&inst.session_mcp_servers, &servers);
+                    if changed {
+                        inst.session_mcp_servers = servers.clone();
+                    }
+                    (inst.source_profile.clone(), changed)
                 }
                 None => return Err(SetSessionMcpError::SessionNotFound),
             }
         };
+
+        // Idempotent: re-asserting the SAME set is a no-op — no persist, no
+        // respawn. The ADR-0021 delivery bridge re-asserts every covered
+        // session's MCP set each reconcile pass; without this gate every pass
+        // (and every bridge restart) would shut down + respawn every covered
+        // session, interrupting in-flight agent turns (a respawn storm). Only a
+        // real change is worth tearing a live worker down for.
+        if !changed {
+            return Ok(());
+        }
 
         let storage = crate::session::Storage::open_unwatched(&profile)
             .map_err(|e| SetSessionMcpError::Storage(e.to_string()))?;
@@ -1643,6 +1658,33 @@ impl SessionService {
             .expect("one submission watcher per service");
         rx
     }
+}
+
+/// True when `new` is a semantically different per-session MCP set from `old` —
+/// the signal to persist + respawn the worker. Order-insensitive: the persisted
+/// set and an incoming re-assertion may list the same servers in a different
+/// order, and that is NOT a change. Server names are unique within a session set
+/// (see `PluginMcpServer::name` / `ProjectMcpServer::name`), so sorting by name
+/// yields a deterministic canonical order to compare. Every other difference —
+/// an added or removed server, or a changed transport / url / headers / env /
+/// token on a same-named one — is a real change, because `ProjectMcpServer`'s
+/// derived `Eq` covers the full transport payload INCLUDING secret values (a
+/// rotated token is an effective config change; see `project_mcp.rs`).
+#[cfg(feature = "serve")]
+fn mcp_set_changed(
+    old: &[crate::session::mcp::project_mcp::ProjectMcpServer],
+    new: &[crate::session::mcp::project_mcp::ProjectMcpServer],
+) -> bool {
+    if old.len() != new.len() {
+        return true;
+    }
+    let mut old_sorted: Vec<&crate::session::mcp::project_mcp::ProjectMcpServer> =
+        old.iter().collect();
+    let mut new_sorted: Vec<&crate::session::mcp::project_mcp::ProjectMcpServer> =
+        new.iter().collect();
+    old_sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    new_sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    old_sorted != new_sorted
 }
 
 /// Releases a session's `pending_drains` claim on every exit path of
@@ -2868,5 +2910,107 @@ mod tests {
         let (sub, combined) = queue_drain_batch(&q, claude);
         assert_eq!(sub.len(), 3);
         assert_eq!(combined, "one\n\nthree");
+    }
+
+    #[cfg(feature = "serve")]
+    mod mcp_set_changed_tests {
+        use super::super::mcp_set_changed;
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+        use std::collections::BTreeMap;
+
+        fn http(name: &str, url: &str, token: &str) -> ProjectMcpServer {
+            let mut headers = BTreeMap::new();
+            headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+            ProjectMcpServer {
+                name: name.to_string(),
+                transport: ProjectMcpTransport::Http {
+                    url: url.to_string(),
+                    headers,
+                },
+            }
+        }
+
+        fn stdio(name: &str, command: &str) -> ProjectMcpServer {
+            ProjectMcpServer {
+                name: name.to_string(),
+                transport: ProjectMcpTransport::Stdio {
+                    command: command.to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                },
+            }
+        }
+
+        #[test]
+        fn identical_same_order_is_unchanged() {
+            let a = vec![http("agent-mcp", "https://mcp/1", "t1"), stdio("fs", "srv")];
+            let b = a.clone();
+            assert!(
+                !mcp_set_changed(&a, &b),
+                "an identical re-assertion must NOT be a change (no respawn)"
+            );
+        }
+
+        #[test]
+        fn identical_different_order_is_unchanged() {
+            let a = vec![http("agent-mcp", "https://mcp/1", "t1"), stdio("fs", "srv")];
+            let b = vec![stdio("fs", "srv"), http("agent-mcp", "https://mcp/1", "t1")];
+            assert!(
+                !mcp_set_changed(&a, &b),
+                "same set in a different order must NOT be a change"
+            );
+        }
+
+        #[test]
+        fn added_server_is_changed() {
+            let a = vec![http("agent-mcp", "https://mcp/1", "t1")];
+            let b = vec![http("agent-mcp", "https://mcp/1", "t1"), stdio("fs", "srv")];
+            assert!(mcp_set_changed(&a, &b), "an added server is a change");
+        }
+
+        #[test]
+        fn removed_server_is_changed() {
+            let a = vec![http("agent-mcp", "https://mcp/1", "t1"), stdio("fs", "srv")];
+            let b = vec![http("agent-mcp", "https://mcp/1", "t1")];
+            assert!(mcp_set_changed(&a, &b), "a removed server is a change");
+        }
+
+        #[test]
+        fn changed_url_is_changed() {
+            let a = vec![http("agent-mcp", "https://mcp/1", "t1")];
+            let b = vec![http("agent-mcp", "https://mcp/2", "t1")];
+            assert!(mcp_set_changed(&a, &b), "a changed url is a change");
+        }
+
+        #[test]
+        fn changed_token_is_changed() {
+            let a = vec![http("agent-mcp", "https://mcp/1", "t1")];
+            let b = vec![http("agent-mcp", "https://mcp/1", "t2")];
+            assert!(
+                mcp_set_changed(&a, &b),
+                "a rotated token is an effective config change"
+            );
+        }
+
+        #[test]
+        fn renamed_server_is_changed() {
+            let a = vec![http("agent-mcp", "https://mcp/1", "t1")];
+            let b = vec![http("agent-mcp-2", "https://mcp/1", "t1")];
+            assert!(mcp_set_changed(&a, &b), "a renamed server is a change");
+        }
+
+        #[test]
+        fn empty_to_empty_is_unchanged() {
+            let a: Vec<ProjectMcpServer> = Vec::new();
+            let b: Vec<ProjectMcpServer> = Vec::new();
+            assert!(!mcp_set_changed(&a, &b), "empty→empty is not a change");
+        }
+
+        #[test]
+        fn empty_to_nonempty_is_changed() {
+            let a: Vec<ProjectMcpServer> = Vec::new();
+            let b = vec![http("agent-mcp", "https://mcp/1", "t1")];
+            assert!(mcp_set_changed(&a, &b), "empty→non-empty is a change");
+        }
     }
 }
