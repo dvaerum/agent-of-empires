@@ -78,6 +78,19 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "session.create",
     "session.prompt",
     "session.unattended",
+    // Attaching per-session MCP servers: the `mcp_servers` field of
+    // `session.create` and the `session.mcp.set` RPC. High-severity and distinct
+    // from `session.create` / `session.write` because an MCP server is code the
+    // agent runs (a stdio server launches a local process) or a remote endpoint
+    // it hands secrets to (an http/sse server with a bearer token), and it is
+    // the HIGHEST-precedence MCP layer, so it can shadow a name the operator
+    // configured globally. It is ALSO the trust anchor for the session MCP layer:
+    // holding this grant is what authorizes those servers, so the layer is not
+    // subject to the repo-trust fingerprint gate (which guards only repo-provided
+    // `.mcp.json`). Unlike `session.prompt`, `session.mcp.set` may target ANY
+    // session, not only the caller's own — attaching MCP to a dashboard-created
+    // session is the whole point (the ADR-0021 delivery bridge depends on it).
+    "session.mcp",
 ];
 
 /// How far a plugin is trusted. Host-assigned at load time, never declared in

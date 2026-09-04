@@ -1081,6 +1081,9 @@ pub async fn create_session(
         plugin_create_idempotency: None,
         pending_initial_turn: None,
         acp_mode_id: None,
+        // Per-session MCP is a plugin-only surface (session.mcp); the REST
+        // create body carries none.
+        session_mcp_servers: Vec::new(),
         view: body.view,
         agent_name: body.agent_name,
         agent_model: body.agent_model,

@@ -586,6 +586,21 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_pending: Option<String>,
 
+    /// Per-session MCP servers carried on this session record. Highest
+    /// precedence in the effective set (see [`crate::session::mcp::mcp_model`]):
+    /// a server here shadows the same name from the agent-native / global /
+    /// profile / project-local layers. Unlike those config-file layers, this
+    /// set is specific to THIS session, so two sessions of the same
+    /// agent+profile+project can carry different servers — e.g. each its own
+    /// agent-mcp url + bearer token — letting a session authenticate to a
+    /// remote MCP as its own identity. Set at create time (plugin
+    /// `sessions.create` `mcp_servers`) or on a running session via the
+    /// `session.mcp.set` plugin RPC; the supervisor reads it here and forwards
+    /// it on the next `session/new` / `session/load`. Additive: absent in older
+    /// `sessions.json` rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_mcp_servers: Vec<crate::session::mcp::project_mcp::ProjectMcpServer>,
+
     // Live process state and durable capture-generation guards.
     /// Latest ACP initialize result for session/load. A daemon restart returns
     /// this to unknown until the worker reconnects.
