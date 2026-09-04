@@ -284,6 +284,24 @@ pub struct AcpDeps {
     pub control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
 }
 
+/// Failure of [`SessionService::set_session_mcp_servers`].
+#[derive(Debug)]
+pub(crate) enum SetSessionMcpError {
+    /// No session with the given id exists.
+    SessionNotFound,
+    /// Persisting the updated set failed; nothing was restarted.
+    Storage(String),
+}
+
+impl std::fmt::Display for SetSessionMcpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionNotFound => write!(f, "session not found"),
+            Self::Storage(e) => write!(f, "failed to persist session MCP servers: {e}"),
+        }
+    }
+}
+
 impl SessionService {
     pub fn new(
         instances: Arc<RwLock<Vec<Instance>>>,
@@ -1333,6 +1351,77 @@ impl SessionService {
         .await;
     }
 
+    /// Replace a session's per-session MCP set (`Instance.session_mcp_servers`)
+    /// and restart its worker so the new servers forward on the next
+    /// `session/load` (#2897 / ADR-0021). Backs the `session.mcp.set` plugin
+    /// RPC; may target ANY session, not only the caller's own — attaching MCP
+    /// to a dashboard-created session is the whole point, so ownership is NOT
+    /// checked here (the `session.mcp` grant is the authorization).
+    ///
+    /// Persists BEFORE restarting so the supervisor reads the new set back from
+    /// the session record when it resolves the effective MCP at spawn, and so a
+    /// daemon restart keeps it. ACP delivers MCP only at session start — there
+    /// is no live MCP mutation on a running worker (the servers are sent on
+    /// `session/new` / `session/load` only; see `acp::acp_client`) — so a live
+    /// worker is torn down (transcript-preserving `shutdown`) and re-requested;
+    /// the reconciler resumes it via `session/load` with the new set. A stopped
+    /// session is only re-requested, so it comes back with the new set on the
+    /// next tick.
+    pub(crate) async fn set_session_mcp_servers(
+        self: &Arc<Self>,
+        id: &str,
+        servers: Vec<crate::session::mcp::project_mcp::ProjectMcpServer>,
+    ) -> Result<(), SetSessionMcpError> {
+        // Serialize against other per-instance mutations, like the other
+        // instance-mutating service methods.
+        let lock = self.instance_lock(id).await;
+        let _guard = lock.lock().await;
+
+        let profile = {
+            let mut instances = self.instances.write().await;
+            match instances.iter_mut().find(|i| i.id == id) {
+                Some(inst) => {
+                    inst.session_mcp_servers = servers.clone();
+                    inst.source_profile.clone()
+                }
+                None => return Err(SetSessionMcpError::SessionNotFound),
+            }
+        };
+
+        let storage = crate::session::Storage::open_unwatched(&profile)
+            .map_err(|e| SetSessionMcpError::Storage(e.to_string()))?;
+        let id_persist = id.to_string();
+        let servers_persist = servers;
+        tokio::task::spawn_blocking(move || {
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                    inst.session_mcp_servers = servers_persist;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| SetSessionMcpError::Storage(format!("persist task failed: {e}")))?
+        .map_err(|e| SetSessionMcpError::Storage(e.to_string()))?;
+
+        // Restart so the new MCP forwards on the next session start. A live
+        // worker must come down first (there is no live MCP mutation); then the
+        // reconciler fresh-spawns it, resuming via session/load. request_respawn
+        // bypasses the attempted-guard so a session with no live worker is
+        // brought back too.
+        if self.acp_supervisor.is_running(id).await {
+            if let Err(e) = self.acp_supervisor.shutdown(id).await {
+                tracing::warn!(
+                    target: "acp.mcp",
+                    session = %id,
+                    "worker shutdown for MCP restart failed; the reconciler still respawns it: {e}"
+                );
+            }
+        }
+        self.acp_supervisor.request_respawn(id);
+        Ok(())
+    }
+
     /// Same lazy per-instance mutex registry as `AppState::instance_lock`;
     /// both operate on the shared map, so a lock taken through either handle
     /// excludes the other.
@@ -1742,6 +1831,7 @@ mod tests {
             plugin_create_idempotency: None,
             pending_initial_turn: None,
             acp_mode_id: None,
+            session_mcp_servers: Vec::new(),
             view: crate::session::View::Structured,
             agent_name: Some("claude".to_string()),
             agent_model: None,

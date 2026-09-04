@@ -597,10 +597,22 @@ fn resolve_mcp_layers(
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
     use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
+    // The session's OWN MCP set (highest precedence): read from the persisted
+    // session record so BOTH the initial spawn and every respawn pick up the
+    // current value, including one just written by the `session.mcp.set` plugin
+    // RPC (which persists before triggering the restart). The record is
+    // authoritative on disk by the time any spawn runs — create persists the
+    // instance before the supervisor spawns it. This is loaded HERE, in the
+    // supervisor, and passed into `resolve_effective` as a slice, so the
+    // always-compiled resolver never does I/O keyed by session id. Fail-soft: a
+    // missing profile/record contributes no session layer rather than blocking
+    // the spawn.
+    let session_servers = load_session_mcp_servers(profile, session_id);
+
     // One resolver for forwarding and the management surfaces (#1996): assemble
     // the trust-gated, provenance-tagged effective set, then convert only the
     // winning definitions to ACP wire values just before forwarding.
-    let merged = resolve_effective(agent_key, profile, cwd);
+    let merged = resolve_effective(agent_key, profile, cwd, &session_servers);
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -611,6 +623,48 @@ fn resolve_mcp_layers(
         );
     }
     crate::acp::mcp_config::project_servers_to_acp(merged.into_iter().map(|s| s.def).collect())
+}
+
+/// Load the per-session MCP set from the persisted session record for the
+/// highest-precedence `Session` layer. Reads the profile's `sessions.json`
+/// (via `Storage::open`, which never births a profile) and returns the matching
+/// instance's `session_mcp_servers`. Fail-soft by design: an unknown profile, a
+/// missing record, or a read error contributes NO session layer rather than
+/// aborting the spawn — the session simply runs with the config-file layers,
+/// exactly as it did before this feature. Runs inside the spawn's blocking hop
+/// alongside the other MCP config reads.
+fn load_session_mcp_servers(
+    profile: Option<&str>,
+    session_id: &str,
+) -> Vec<crate::session::mcp::project_mcp::ProjectMcpServer> {
+    let storage = match crate::session::Storage::open_unwatched(profile.unwrap_or_default()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "could not open storage for per-session MCP; contributing none from it"
+            );
+            return Vec::new();
+        }
+    };
+    match storage.load() {
+        Ok(instances) => instances
+            .into_iter()
+            .find(|i| i.id == session_id)
+            .map(|i| i.session_mcp_servers)
+            .unwrap_or_default(),
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "failed to load session record for per-session MCP; contributing none from it"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Overlay an instance command override onto a resolved `AgentSpec`.

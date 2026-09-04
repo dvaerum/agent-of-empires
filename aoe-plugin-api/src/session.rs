@@ -6,7 +6,50 @@
 //! trust, or pass agent launch flags. The caller's plugin identity comes
 //! from the RPC connection, never from these payloads.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+/// One MCP server a plugin attaches to a session (`mcp_servers` on
+/// `sessions.create`, or the `servers` of `session.mcp.set`). Mirrors the
+/// ecosystem `.mcp.json` entry shape the host already parses for every other
+/// MCP layer: `transport` discriminates `stdio` (the default) from the `http`
+/// and `sse` remote transports. The host converts this into its internal
+/// project-MCP type, so a per-session server flows through the exact same
+/// forwarding path as a global or project-local one — the point being that each
+/// session can carry its OWN servers (e.g. its own agent-mcp url + bearer
+/// token) and so authenticate to a remote MCP as its own identity. Requires the
+/// high-severity `session.mcp` grant. `env` / `headers` are `BTreeMap` so the
+/// wire encoding is order-independent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginMcpServer {
+    /// Unique name within the session set; the key a same-named lower-layer
+    /// server is shadowed under.
+    pub name: String,
+    /// `"stdio"` (default), `"http"`, or `"sse"`. Validated host-side.
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// stdio: the executable to launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// stdio: arguments passed to `command`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// stdio: environment for the launched process (values are secrets).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// http / sse: the endpoint URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// http / sse: request headers (values are secrets, e.g. a bearer token).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+fn default_transport() -> String {
+    "stdio".to_string()
+}
 
 /// Parameters of `sessions.create`. Requires the `session.create` grant;
 /// additionally `session.prompt` when `initial_turn` is present and
@@ -58,6 +101,13 @@ pub struct SessionsCreateRequest {
     /// conflict. Retained while the session record exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Per-session MCP servers for the created session, the highest-precedence
+    /// MCP layer (a name here shadows the same name from every config-file
+    /// layer). Requires the high-severity `session.mcp` grant; a non-empty
+    /// value without it is refused. Empty (the default) keeps the pre-feature
+    /// behavior. API v13.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<PluginMcpServer>,
 }
 
 /// The initial prompt of a created session.
@@ -73,6 +123,22 @@ pub struct SessionsCreateResponse {
     pub session_id: String,
     /// `false` when an existing session was returned by idempotency.
     pub created: bool,
+}
+
+/// Parameters of `session.mcp.set`: replace the per-session MCP set of a
+/// session. Requires the `session.mcp` grant. Unlike `sessions.turn.send`, it
+/// may target ANY session, not only one the calling plugin created — attaching
+/// MCP to a dashboard-created session is the whole point (the ADR-0021 delivery
+/// bridge depends on it). The host persists the set and restarts the worker so
+/// the new servers forward on the next `session/load`. API v13.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMcpSetRequest {
+    pub session_id: String,
+    /// The complete replacement set; an empty vec clears the session's MCP
+    /// servers.
+    #[serde(default)]
+    pub servers: Vec<PluginMcpServer>,
 }
 
 /// Parameters of `sessions.turn.send`. Requires the `session.prompt` grant;
@@ -103,6 +169,7 @@ mod tests {
                 text: "Run the nightly task".into(),
             }),
             idempotency_key: Some("job-1:2026-07-16T03:00:00Z".into()),
+            mcp_servers: Vec::new(),
         };
         let json = serde_json::to_value(&request).expect("serialize");
         assert_eq!(
@@ -149,6 +216,7 @@ mod tests {
             group: None,
             initial_turn: None,
             idempotency_key: None,
+            mcp_servers: Vec::new(),
         };
         let json = serde_json::to_value(&request).expect("serialize");
         assert!(json.get("project_path").is_none());
@@ -170,6 +238,7 @@ mod tests {
             group: None,
             initial_turn: None,
             idempotency_key: None,
+            mcp_servers: Vec::new(),
         };
         // Default (false) is omitted so it never bloats a fixture.
         assert!(serde_json::to_value(&request)
@@ -196,12 +265,114 @@ mod tests {
             group: None,
             initial_turn: None,
             idempotency_key: None,
+            mcp_servers: Vec::new(),
         };
         let json = serde_json::to_value(&request).expect("serialize");
         assert_eq!(
             json["extra_project_paths"],
             serde_json::json!(["/repos/lib", "/repos/proto"])
         );
+        let round: SessionsCreateRequest = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round, request);
+    }
+
+    #[test]
+    fn plugin_mcp_server_wire_fixture_is_stable() {
+        // The stdio default is implicit on the wire and the empty maps are
+        // omitted, so a minimal stdio server stays compact.
+        let stdio = PluginMcpServer {
+            name: "fs".into(),
+            transport: "stdio".into(),
+            command: Some("mcp-fs".into()),
+            args: vec!["--root".into(), ".".into()],
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+        };
+        let json = serde_json::to_value(&stdio).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "fs",
+                "transport": "stdio",
+                "command": "mcp-fs",
+                "args": ["--root", "."]
+            })
+        );
+        let round: PluginMcpServer = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round, stdio);
+
+        // An http server carries its url + a header secret; transport is
+        // explicit here since it is not the stdio default.
+        let http = PluginMcpServer {
+            name: "agent-mcp".into(),
+            transport: "http".into(),
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: Some("https://agent-mcp.example/mcp".into()),
+            headers: BTreeMap::from([("Authorization".to_string(), "Bearer tok".to_string())]),
+        };
+        let json = serde_json::to_value(&http).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "agent-mcp",
+                "transport": "http",
+                "url": "https://agent-mcp.example/mcp",
+                "headers": {"Authorization": "Bearer tok"}
+            })
+        );
+        let round: PluginMcpServer = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round, http);
+    }
+
+    #[test]
+    fn plugin_mcp_server_transport_defaults_to_stdio() {
+        // `transport` omitted -> stdio, matching the ecosystem `.mcp.json`
+        // default, so the common stdio case needs no discriminator.
+        let server: PluginMcpServer =
+            serde_json::from_value(serde_json::json!({ "name": "fs", "command": "mcp-fs" }))
+                .expect("deserialize");
+        assert_eq!(server.transport, "stdio");
+    }
+
+    #[test]
+    fn plugin_mcp_server_rejects_unknown_fields() {
+        let err = serde_json::from_value::<PluginMcpServer>(serde_json::json!({
+            "name": "fs",
+            "command": "mcp-fs",
+            "smuggled": true
+        }))
+        .expect_err("unknown fields must be rejected");
+        assert!(err.to_string().contains("smuggled"));
+    }
+
+    #[test]
+    fn create_request_carries_mcp_servers() {
+        let request = SessionsCreateRequest {
+            agent_id: "claude".into(),
+            project_path: Some("/p".into()),
+            extra_project_paths: Vec::new(),
+            sandbox: false,
+            model_id: None,
+            mode_id: None,
+            title: None,
+            group: None,
+            initial_turn: None,
+            idempotency_key: None,
+            mcp_servers: vec![PluginMcpServer {
+                name: "agent-mcp".into(),
+                transport: "http".into(),
+                command: None,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                url: Some("https://agent-mcp.example/mcp".into()),
+                headers: BTreeMap::from([("Authorization".to_string(), "Bearer tok".to_string())]),
+            }],
+        };
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(json["mcp_servers"][0]["name"], "agent-mcp");
         let round: SessionsCreateRequest = serde_json::from_value(json).expect("deserialize");
         assert_eq!(round, request);
     }

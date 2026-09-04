@@ -17,7 +17,10 @@ use aoe_plugin_api::acp::{
     AcpAgentCapability, AcpCapabilitiesResponse, AcpModeCapability, AcpModelCapability,
     AcpThinkingCapability, ApprovalClass, CatalogStatus,
 };
-use aoe_plugin_api::session::{SessionsCreateRequest, SessionsCreateResponse, TurnSendRequest};
+use aoe_plugin_api::session::{
+    PluginMcpServer, SessionMcpSetRequest, SessionsCreateRequest, SessionsCreateResponse,
+    TurnSendRequest,
+};
 
 use crate::acp::option_catalog::{AgentOptionEntry, OptionCatalog};
 use crate::acp::state::ConfigOptionCategory;
@@ -26,8 +29,10 @@ use crate::plugin::host_api::{DispatchError, PluginRpcContext};
 use crate::plugin::protocol::codes;
 use crate::server::session_service::{
     CreateIdempotencyProbe, IdempotencyConflict, SendTurnError, SessionCaller, SessionService,
+    SetSessionMcpError,
 };
 use crate::server::session_spawn::StructuredSessionSpec;
+use crate::session::mcp::project_mcp::ProjectMcpServer;
 
 /// Upper bound on `extra_project_paths` per create, so one plugin call cannot
 /// trigger an unbounded chain of blocking `canonicalize` calls.
@@ -38,6 +43,7 @@ const CAP_ACP_CAPABILITIES_PROBE: &str = "acp.capabilities.probe";
 const CAP_SESSION_CREATE: &str = "session.create";
 const CAP_SESSION_PROMPT: &str = "session.prompt";
 const CAP_SESSION_UNATTENDED: &str = "session.unattended";
+const CAP_SESSION_MCP: &str = "session.mcp";
 
 /// Everything the session RPCs need, injected into the plugin host at
 /// construction (before any worker launches).
@@ -56,6 +62,7 @@ pub(crate) fn handles(method: &str) -> bool {
             | "acp.capabilities.probe"
             | "sessions.create"
             | "sessions.turn.send"
+            | "session.mcp.set"
     )
 }
 
@@ -68,6 +75,7 @@ pub(crate) fn required_capability(method: &str) -> Option<&'static str> {
         "acp.capabilities.probe" => Some(CAP_ACP_CAPABILITIES_PROBE),
         "sessions.create" => Some(CAP_SESSION_CREATE),
         "sessions.turn.send" => Some(CAP_SESSION_PROMPT),
+        "session.mcp.set" => Some(CAP_SESSION_MCP),
         _ => None,
     }
 }
@@ -94,6 +102,10 @@ pub(crate) async fn dispatch(
         "sessions.turn.send" => {
             ctx.require(CAP_SESSION_PROMPT)?;
             sessions_turn_send(deps, ctx, params).await
+        }
+        "session.mcp.set" => {
+            ctx.require(CAP_SESSION_MCP)?;
+            sessions_mcp_set(deps, ctx, params).await
         }
         other => Err(DispatchError::internal(format!(
             "session_api routed unknown method {other:?}"
@@ -361,6 +373,17 @@ async fn admit_and_create(
         ctx.require(CAP_SESSION_PROMPT)?;
     }
 
+    // Per-session MCP is a distinct, high-severity surface: a non-empty set
+    // needs the `session.mcp` grant. Convert into the host's project-MCP type
+    // (reusing the ecosystem `.mcp.json` parse) so it flows through the same
+    // forwarding path as every other MCP layer.
+    let session_mcp_servers = if req.mcp_servers.is_empty() {
+        Vec::new()
+    } else {
+        ctx.require(CAP_SESSION_MCP)?;
+        plugin_mcp_servers_to_project(&req.mcp_servers)?
+    };
+
     // Resolve the project selection into (path, extra_repo_paths, scratch).
     // No project -> a scratch session (no repo, hence no trust anchor). One or
     // more projects -> the first is the trust-checked primary repo and the rest
@@ -463,6 +486,10 @@ async fn admit_and_create(
         // hashes the same payload the create will.
         pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
         acp_mode_id: req.mode_id.clone(),
+        // Set here (not only inside the service) so the idempotency probe hashes
+        // the same payload the create persists: a different MCP set is a
+        // different create.
+        session_mcp_servers,
         view: crate::session::View::Structured,
         agent_name: None,
         agent_model: req.model_id.clone(),
@@ -610,6 +637,115 @@ async fn sessions_turn_send(
     Ok(serde_json::json!({}))
 }
 
+/// Convert plugin-supplied MCP servers into the host's project-MCP type by
+/// rebuilding the ecosystem `.mcp.json` shape and running it through the SAME
+/// parser (`parse_standard_mcp_servers`) every other MCP layer uses, so
+/// transport/command/url validation and error messages are identical. Rejects a
+/// blank or duplicate name (a `BTreeMap` parse would otherwise silently collapse
+/// duplicates).
+fn plugin_mcp_servers_to_project(
+    servers: &[PluginMcpServer],
+) -> Result<Vec<ProjectMcpServer>, DispatchError> {
+    let mut entries = serde_json::Map::new();
+    for server in servers {
+        let name = server.name.trim();
+        if name.is_empty() {
+            return Err(DispatchError::invalid_params(
+                "MCP server \"name\" must be non-empty",
+            ));
+        }
+        if entries.contains_key(name) {
+            return Err(DispatchError::invalid_params(format!(
+                "duplicate MCP server name {name:?}"
+            )));
+        }
+        let mut entry = serde_json::Map::new();
+        // The plugin DTO says `transport`; the ecosystem `.mcp.json` says
+        // `type`. Map it so the shared parser sees the shape it expects.
+        entry.insert("type".into(), Value::String(server.transport.clone()));
+        if let Some(command) = &server.command {
+            entry.insert("command".into(), Value::String(command.clone()));
+        }
+        if !server.args.is_empty() {
+            entry.insert(
+                "args".into(),
+                serde_json::to_value(&server.args)
+                    .map_err(|e| DispatchError::internal(e.to_string()))?,
+            );
+        }
+        if !server.env.is_empty() {
+            entry.insert(
+                "env".into(),
+                serde_json::to_value(&server.env)
+                    .map_err(|e| DispatchError::internal(e.to_string()))?,
+            );
+        }
+        if let Some(url) = &server.url {
+            entry.insert("url".into(), Value::String(url.clone()));
+        }
+        if !server.headers.is_empty() {
+            entry.insert(
+                "headers".into(),
+                serde_json::to_value(&server.headers)
+                    .map_err(|e| DispatchError::internal(e.to_string()))?,
+            );
+        }
+        entries.insert(name.to_string(), Value::Object(entry));
+    }
+    let wrapped = serde_json::json!({ "mcpServers": Value::Object(entries) });
+    let text =
+        serde_json::to_string(&wrapped).map_err(|e| DispatchError::internal(e.to_string()))?;
+    crate::session::mcp::project_mcp::parse_standard_mcp_servers(&text)
+        .map_err(|e| DispatchError::invalid_params(format!("invalid MCP server definition: {e}")))
+}
+
+async fn sessions_mcp_set(
+    deps: &Arc<SessionRpcDeps>,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let req: SessionMcpSetRequest = serde_json::from_value(params.clone())
+        .map_err(|e| DispatchError::invalid_params(format!("session.mcp.set params: {e}")))?;
+    let plugin_id = ctx.plugin_id.clone();
+    // Convert (and validate) before touching the session, so a malformed
+    // payload never restarts a worker.
+    let servers = plugin_mcp_servers_to_project(&req.servers)?;
+
+    let result = deps
+        .session_service
+        .set_session_mcp_servers(&req.session_id, servers)
+        .await
+        .map_err(map_mcp_set_error);
+
+    deps.policy.audit(
+        &plugin_id,
+        serde_json::json!({
+            "op": "session.mcp.set",
+            "session": req.session_id,
+            "count": req.servers.len(),
+            "decision": if result.is_ok() { "ok" } else { "denied" },
+            "kind": result.as_ref().err().and_then(|e| {
+                e.data.as_ref().and_then(|d| d.get("kind")).cloned()
+            }),
+        }),
+    );
+    result?;
+    Ok(serde_json::json!({ "status": "set" }))
+}
+
+fn map_mcp_set_error(e: SetSessionMcpError) -> DispatchError {
+    match e {
+        SetSessionMcpError::SessionNotFound => DispatchError::with_kind(
+            codes::INVALID_PARAMS,
+            "session_not_found",
+            "session not found",
+        ),
+        SetSessionMcpError::Storage(msg) => {
+            DispatchError::internal(format!("failed to persist session MCP servers: {msg}"))
+        }
+    }
+}
+
 fn map_send_error(e: SendTurnError) -> DispatchError {
     match e {
         SendTurnError::SessionNotFound => DispatchError::with_kind(
@@ -705,6 +841,7 @@ mod tests {
             "acp.capabilities.probe",
             "sessions.create",
             "sessions.turn.send",
+            "session.mcp.set",
         ] {
             let err = dispatch(&deps, &none, method, &serde_json::json!({}))
                 .await
@@ -846,6 +983,80 @@ mod tests {
         .expect_err("must be denied at the active-session limit");
         assert_eq!(err.code, codes::RATE_LIMITED);
         assert_eq!(kind(&err), "concurrency_limited");
+    }
+
+    /// A create carrying `mcp_servers` needs the distinct `session.mcp` grant;
+    /// `session.create` alone is refused before any spawn work.
+    #[tokio::test]
+    async fn create_with_mcp_servers_requires_session_mcp_grant() {
+        let (deps, _dir) = test_deps(Vec::new());
+        let params = serde_json::json!({
+            "agent_id": "claude",
+            "project_path": "/tmp",
+            "mcp_servers": [
+                { "name": "agent-mcp", "transport": "http", "url": "https://e/mcp" }
+            ],
+        });
+        // Has create but NOT session.mcp.
+        let ctx = ctx_with(&["session.create"]);
+        let err = dispatch(&deps, &ctx, "sessions.create", &params)
+            .await
+            .expect_err("mcp_servers without session.mcp must be refused");
+        assert_eq!(err.code, codes::FORBIDDEN);
+        assert_eq!(kind(&err), "capability_missing");
+    }
+
+    /// The per-session MCP conversion rejects a malformed server (a remote
+    /// transport with no url) with invalid-params, mirroring the ecosystem
+    /// `.mcp.json` parser it reuses.
+    #[test]
+    fn plugin_mcp_conversion_rejects_missing_url() {
+        let err = plugin_mcp_servers_to_project(&[PluginMcpServer {
+            name: "agent-mcp".into(),
+            transport: "http".into(),
+            command: None,
+            args: Vec::new(),
+            env: Default::default(),
+            url: None,
+            headers: Default::default(),
+        }])
+        .expect_err("http without url must be rejected");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// A duplicate server name is rejected rather than silently collapsed.
+    #[test]
+    fn plugin_mcp_conversion_rejects_duplicate_names() {
+        let dup = PluginMcpServer {
+            name: "agent-mcp".into(),
+            transport: "http".into(),
+            command: None,
+            args: Vec::new(),
+            env: Default::default(),
+            url: Some("https://e/mcp".into()),
+            headers: Default::default(),
+        };
+        let err = plugin_mcp_servers_to_project(&[dup.clone(), dup])
+            .expect_err("duplicate names must be rejected");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// `session.mcp.set` against a non-existent session maps to the stable
+    /// not-found kind (and never restarts anything).
+    #[tokio::test]
+    async fn mcp_set_missing_session_maps_not_found() {
+        let (deps, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.mcp"]);
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "session.mcp.set",
+            &serde_json::json!({ "session_id": "sess-gone", "servers": [] }),
+        )
+        .await
+        .expect_err("unknown session must be refused");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+        assert_eq!(kind(&err), "session_not_found");
     }
 
     /// turn.send maps the service's ownership and existence denials to the

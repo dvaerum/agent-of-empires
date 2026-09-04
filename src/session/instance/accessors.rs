@@ -70,6 +70,7 @@ impl Instance {
             acp_session_id: None,
             import_pending: None,
             fork_pending: None,
+            session_mcp_servers: Vec::new(),
             last_error_check: None,
             last_start_time: None,
             live_status_baseline: None,

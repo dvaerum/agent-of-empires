@@ -42,6 +42,15 @@ pub enum McpProvenance {
     Profile { name: String },
     /// The repo's trusted `cwd/.mcp.json`.
     ProjectLocal,
+    /// The session's own MCP set, carried on the session record
+    /// (`Instance.session_mcp_servers`) and set at create time (plugin
+    /// `sessions.create` `mcp_servers`) or on a running session via the
+    /// `session.mcp.set` plugin RPC. Highest precedence: a session entry (e.g.
+    /// one named `agent-mcp`) shadows the same name from every config-file
+    /// layer, so each session can authenticate to a remote MCP as its OWN
+    /// identity (its own url + bearer token). Trust anchor is the `session.mcp`
+    /// grant, NOT the repo-trust fingerprint (see [`resolve_effective`]).
+    Session,
     /// A server AoE last saw in the named agent's native config that has since
     /// disappeared from it. Kept in AoE's view (keep-on-removal, feature D) and
     /// not forwarded until the user keeps it (promoting it to `global`) or drops
@@ -58,6 +67,7 @@ impl McpProvenance {
             McpProvenance::Global => "global".to_string(),
             McpProvenance::Profile { name } => format!("profile:{name}"),
             McpProvenance::ProjectLocal => "project-local".to_string(),
+            McpProvenance::Session => "session".to_string(),
             McpProvenance::KeptOnRemoval { agent } => format!("kept-on-removal:{agent}"),
         }
     }
@@ -198,23 +208,37 @@ pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
 
 /// Resolve the effective MCP server set for a session context, applying the
 /// full precedence stack: agent-native -> global -> per-profile ->
-/// project-local (trust-gated), higher wins per name. This is the single source
-/// of truth for BOTH forwarding (the supervisor converts the winning set to ACP)
-/// and the management surfaces (#1996), so what the user sees equals what the
-/// agent receives.
+/// project-local (trust-gated) -> session, higher wins per name. This is the
+/// single source of truth for BOTH forwarding (the supervisor converts the
+/// winning set to ACP) and the management surfaces (#1996), so what the user
+/// sees equals what the agent receives.
 ///
-/// Each layer is isolated: a missing, unreadable, or malformed source warns and
-/// contributes nothing rather than aborting, so a single broken file never
-/// blocks a spawn. `profile` is the session's source profile; an empty/`None`
-/// value resolves to the default. `cwd` is the session working directory, from
-/// which the project-local repo (and its `.mcp.json`) is resolved. The
-/// project-local layer is forwarded ONLY when the repo is trusted at the file's
-/// current fingerprint; an untrusted (or changed) file is skipped and logged,
-/// exactly like the create-time trust gate refuses untrusted hooks.
+/// Each config-file layer is isolated: a missing, unreadable, or malformed
+/// source warns and contributes nothing rather than aborting, so a single
+/// broken file never blocks a spawn. `profile` is the session's source profile;
+/// an empty/`None` value resolves to the default. `cwd` is the session working
+/// directory, from which the project-local repo (and its `.mcp.json`) is
+/// resolved. The project-local layer is forwarded ONLY when the repo is trusted
+/// at the file's current fingerprint; an untrusted (or changed) file is skipped
+/// and logged, exactly like the create-time trust gate refuses untrusted hooks.
+///
+/// `session_servers` is the session's OWN set (from `Instance.session_mcp_servers`),
+/// appended as the highest-precedence layer so a session entry shadows the same
+/// name from every config-file layer. It is passed IN, already loaded: the
+/// resolver never does I/O keyed by session id. This layer is TRUST-BY-GRANT —
+/// the `session.mcp` capability grant that let the plugin set it IS the trust
+/// anchor, so it deliberately does NOT run through `is_repo_trusted`. The repo
+/// fingerprint gate exists only for the repo-provided project-local layer (a
+/// repo's `.mcp.json` is a zero-click RCE surface AoE did not author); a session
+/// set is host-side, plugin-authorized data, not repo-provided, so gating it on
+/// the repo fingerprint would be both wrong (it is not the repo's) and broken (a
+/// session server naming a name the repo never had has no repo fingerprint to
+/// match). Do not "fix" this by adding a trust call here.
 pub fn resolve_effective(
     agent_key: &str,
     profile: Option<&str>,
     cwd: &Path,
+    session_servers: &[ProjectMcpServer],
 ) -> Vec<ResolvedMcpServer> {
     let native = load_native_mcp_servers_from_home(agent_key, profile).unwrap_or_else(|e| {
         warn!(
@@ -297,6 +321,10 @@ pub fn resolve_effective(
             provenance: McpProvenance::ProjectLocal,
             servers: project_local,
         },
+        McpLayer {
+            provenance: McpProvenance::Session,
+            servers: session_servers.to_vec(),
+        },
     ])
 }
 
@@ -328,7 +356,10 @@ pub struct McpSurfaceView {
 /// reconcile updates the snapshot (silent adoption of new servers); conflicts
 /// and removals persist until the user resolves them.
 pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSurfaceView {
-    let effective = resolve_effective(agent, profile, cwd);
+    // The management surface renders the config-file layers; the per-session
+    // layer is a forwarding-time concern resolved by the supervisor from the
+    // session record, so pass an empty session set here.
+    let effective = resolve_effective(agent, profile, cwd, &[]);
 
     let reconcile = match load_native_mcp_servers_checked_from_home(agent, profile) {
         Ok(read) => super::mcp_state::reconcile_agent(agent, &read).unwrap_or_else(|e| {
@@ -822,6 +853,54 @@ mod tests {
             "profile:rust"
         );
         assert_eq!(McpProvenance::ProjectLocal.label(), "project-local");
+        assert_eq!(McpProvenance::Session.label(), "session");
+    }
+
+    #[test]
+    fn resolve_session_layer_overrides_lower_layers() {
+        // A session-layer server shadows a global one of the same name: this is
+        // what lets each session point `agent-mcp` at its own url + token.
+        let merged = resolve(vec![
+            layer(
+                McpProvenance::Global,
+                standard(
+                    r#"{ "mcpServers": { "agent-mcp": { "type": "http", "url": "https://global/mcp" } } }"#,
+                ),
+            ),
+            layer(
+                McpProvenance::Session,
+                standard(
+                    r#"{ "mcpServers": { "agent-mcp": { "type": "http", "url": "https://session/mcp", "headers": { "Authorization": "Bearer session-token" } } } }"#,
+                ),
+            ),
+        ]);
+        assert_eq!(resolved_names(&merged), vec!["agent-mcp"]);
+        assert_eq!(merged[0].provenance, McpProvenance::Session);
+        assert_eq!(merged[0].shadowed, vec![McpProvenance::Global]);
+        match &merged[0].def.transport {
+            ProjectMcpTransport::Http { url, .. } => assert_eq!(url, "https://session/mcp"),
+            other => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_session_layer_unions_distinct_names() {
+        // A session server whose name no lower layer has is added, not gated:
+        // there is no repo fingerprint to match, and none is required — the
+        // session layer is trust-by-grant.
+        let merged = resolve(vec![
+            layer(
+                McpProvenance::Global,
+                standard(r#"{ "mcpServers": { "fs": { "command": "global-fs" } } }"#),
+            ),
+            layer(
+                McpProvenance::Session,
+                standard(
+                    r#"{ "mcpServers": { "agent-mcp": { "type": "http", "url": "https://session/mcp" } } }"#,
+                ),
+            ),
+        ]);
+        assert_eq!(resolved_names(&merged), vec!["agent-mcp", "fs"]);
     }
 
     #[test]

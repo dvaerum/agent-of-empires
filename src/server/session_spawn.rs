@@ -60,6 +60,11 @@ pub(crate) struct StructuredSessionSpec {
     /// supervisor applies it after every worker (re)spawn. Stamped by the
     /// plugin host create path after host-side classification.
     pub acp_mode_id: Option<String>,
+    /// Per-session MCP servers to persist on the created instance
+    /// (`Instance.session_mcp_servers`), the highest-precedence MCP layer.
+    /// Set by the plugin host create path from the `session.mcp`-gated
+    /// `mcp_servers` field; empty for user surfaces. See #2897 / ADR-0021.
+    pub session_mcp_servers: Vec<crate::session::mcp::project_mcp::ProjectMcpServer>,
     pub view: crate::session::View,
     pub agent_name: Option<String>,
     pub agent_model: Option<String>,
@@ -141,6 +146,7 @@ pub(crate) async fn spawn_structured_session(
             plugin_create_idempotency,
             pending_initial_turn,
             acp_mode_id,
+            session_mcp_servers,
             view,
             agent_name,
             agent_model,
@@ -226,6 +232,10 @@ pub(crate) async fn spawn_structured_session(
         instance.plugin_create_idempotency = plugin_create_idempotency;
         instance.pending_initial_turn = pending_initial_turn;
         instance.acp_mode_id = acp_mode_id;
+        // Persisted with the instance BEFORE the ACP worker spawns, so the
+        // supervisor reads it back from the session record when it resolves the
+        // effective MCP set at spawn time (see `resolve_mcp_layers`).
+        instance.session_mcp_servers = session_mcp_servers;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
         let build_warnings = build_result.warnings;
