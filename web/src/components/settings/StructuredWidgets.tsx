@@ -297,6 +297,17 @@ function renderItemField(
           multiline={widget.multiline}
         />
       );
+    case "password":
+      return (
+        <TextField
+          key={field.field}
+          label={field.label}
+          description={field.description}
+          value={typeof raw === "string" ? raw : ""}
+          onChange={(v) => setField(field.field, v)}
+          password
+        />
+      );
   }
 }
 

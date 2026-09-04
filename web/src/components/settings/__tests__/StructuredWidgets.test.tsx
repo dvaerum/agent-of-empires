@@ -379,6 +379,107 @@ describe("structured plugin settings widgets", () => {
     expect(screen.getByText("Models")).toBeTruthy();
   });
 
+  it("renders a top-level password setting as a masked input", async () => {
+    const onSave = vi.fn().mockResolvedValue(true);
+    const schema: SettingsFieldDescriptor[] = [
+      {
+        section: "plugin:acme.bridge",
+        field: "token",
+        category: "Plugins",
+        label: "Token",
+        description: "",
+        web_write: ALLOW,
+        profile_overridable: false,
+        validation: NONE,
+        advanced: false,
+        widget: { kind: "password" },
+      },
+    ];
+    const { container } = render(
+      <SchemaSection section="plugin:acme.bridge" schema={schema} values={{ token: "s3cr3t" }} onSaveField={onSave} />,
+    );
+
+    const input = container.querySelector('input[type="password"]') as HTMLInputElement | null;
+    expect(input).not.toBeNull();
+    // Masked by default (type=password) yet carrying the stored value.
+    expect(input!.value).toBe("s3cr3t");
+  });
+
+  it("renders an object_list password item field as a masked input", async () => {
+    const onSave = vi.fn().mockResolvedValue(true);
+    const schema: SettingsFieldDescriptor[] = [
+      {
+        section: "plugin:acme.bridge",
+        field: "servers",
+        category: "Plugins",
+        label: "Servers",
+        description: "",
+        web_write: ALLOW,
+        profile_overridable: false,
+        validation: NONE,
+        advanced: false,
+        widget: {
+          kind: "object_list",
+          id_field: "id",
+          fields: [
+            { field: "token", label: "Token", required: false, widget: { kind: "password" }, validation: { rule: "str" } },
+          ],
+        },
+      },
+    ];
+    const { container } = render(
+      <SchemaSection
+        section="plugin:acme.bridge"
+        schema={schema}
+        values={{ servers: [{ id: "s1", token: "hunter2" }] }}
+        onSaveField={onSave}
+      />,
+    );
+
+    const input = container.querySelector('input[type="password"]') as HTMLInputElement | null;
+    expect(input).not.toBeNull();
+    expect(input!.value).toBe("hunter2");
+  });
+
+  it("resolves a sessions dynamic_select from the host and renders the labels", async () => {
+    // The sessions source resolves live sessions to {value:<id>, label:"<title> (<id>)"}.
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        options: [{ value: "abc123", label: "Backend work (abc123)" }],
+      }),
+    });
+    const onSave = vi.fn().mockResolvedValue(true);
+    const schema: SettingsFieldDescriptor[] = [
+      {
+        section: "plugin:acme.bridge",
+        field: "session_id",
+        category: "Plugins",
+        label: "Session",
+        description: "",
+        web_write: ALLOW,
+        profile_overridable: false,
+        validation: { rule: "str" },
+        advanced: false,
+        widget: { kind: "dynamic_select", source: "sessions" },
+      },
+    ];
+    render(
+      <SchemaSection section="plugin:acme.bridge" schema={schema} values={{ session_id: "" }} onSaveField={onSave} />,
+    );
+
+    // Posted the `sessions` source to the resolver and rendered the host label.
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/plugins/acme.bridge/settings/options/resolve",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+    expect(body.source).toBe("sessions");
+    await waitFor(() => expect(screen.getByText("Backend work (abc123)")).toBeTruthy());
+  });
+
   it("re-syncs its working copy when the persisted items change externally", async () => {
     const onSave = vi.fn().mockResolvedValue(true);
     const { rerender } = render(

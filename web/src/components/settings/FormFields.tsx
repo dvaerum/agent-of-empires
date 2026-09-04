@@ -88,6 +88,7 @@ export function TextField({
   placeholder,
   mono,
   multiline,
+  password,
 }: {
   label: string;
   description?: string;
@@ -96,6 +97,9 @@ export function TextField({
   placeholder?: string;
   mono?: boolean;
   multiline?: boolean;
+  /** Render a masked secret input (`<input type="password">`, dots by
+   *  default). Ignored when `multiline` is set (a secret is single-line). */
+  password?: boolean;
 }) {
   const [local, setLocal] = useState(value);
   const [focused, setFocused] = useState(false);
@@ -131,7 +135,7 @@ export function TextField({
         />
       ) : (
         <input
-          type="text"
+          type={password ? "password" : "text"}
           value={local}
           onChange={(e) => setLocal(e.target.value)}
           onFocus={() => setFocused(true)}
