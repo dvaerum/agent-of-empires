@@ -210,6 +210,11 @@ pub enum OptionSource {
     Projects,
     #[serde(rename = "groups")]
     Groups,
+    /// The operator's live AoE sessions (API v15). Independent (no
+    /// `depends_on`); the host resolves each live session to
+    /// `{ value: <session id>, label: "<title> (<id>)" }`.
+    #[serde(rename = "sessions")]
+    Sessions,
 }
 
 /// One nested field of an `object_list` item (API v9). A restricted,
@@ -262,6 +267,9 @@ pub enum ObjectFieldType {
     /// `option_source` and may `depends_on` siblings. API v11.
     DynamicMultiSelect,
     Cron,
+    /// A secret string, rendered as a masked password input (API v15). Stored
+    /// and validated exactly like `String`; only the widget differs.
+    Password,
 }
 
 /// Validate the API v9 structured-setting shape of one contribution: that a
@@ -486,6 +494,7 @@ fn validate_object_list_default(
                 Some(v) => {
                     let type_ok = match f.value_type {
                         ObjectFieldType::String
+                        | ObjectFieldType::Password
                         | ObjectFieldType::Select
                         | ObjectFieldType::DynamicSelect
                         | ObjectFieldType::Cron => v.is_str(),
@@ -584,6 +593,9 @@ pub enum SettingType {
     ObjectList,
     /// A cron expression, rendered as a validated text field (API v9).
     Cron,
+    /// A secret string, rendered as a masked password input (API v15). Stored
+    /// and validated exactly like `String`; only the widget differs.
+    Password,
 }
 
 /// A color theme the plugin ships. `path` is a theme TOML relative to the
@@ -1108,6 +1120,7 @@ impl PluginManifest {
             if let Some(def) = &s.default {
                 let type_ok = match s.value_type {
                     SettingType::String
+                    | SettingType::Password
                     | SettingType::Select
                     | SettingType::DynamicSelect
                     | SettingType::Cron => def.is_str(),
@@ -1289,6 +1302,29 @@ impl PluginManifest {
             check(
                 self.ui.iter().all(|u| u.slot != UiSlot::HomePane),
                 "home-pane UI slots require api_version >= 13".into(),
+            );
+        }
+        // The `password` field type and the `sessions` option source are
+        // api_version 15; same reasoning as the gates above (a pre-15 host would
+        // otherwise fail with a confusing "unknown variant" rather than the
+        // "upgrade aoe" path).
+        if self.api_version < 15 {
+            check(
+                self.settings.iter().all(|s| {
+                    s.value_type != SettingType::Password
+                        && s.fields
+                            .iter()
+                            .all(|f| f.value_type != ObjectFieldType::Password)
+                }),
+                "password settings / object-list fields require api_version >= 15".into(),
+            );
+            let uses_sessions = |src: Option<OptionSource>| src == Some(OptionSource::Sessions);
+            check(
+                self.settings.iter().all(|s| {
+                    !uses_sessions(s.option_source)
+                        && s.fields.iter().all(|f| !uses_sessions(f.option_source))
+                }),
+                "the `sessions` option source requires api_version >= 15".into(),
             );
         }
         for key in self.setting_defaults.keys() {
@@ -1563,6 +1599,94 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("exactly one ui slot"), "{err}");
+    }
+
+    #[test]
+    fn option_source_sessions_round_trips() {
+        // Serde rename is exactly "sessions" in both directions.
+        assert_eq!(
+            serde_json::to_string(&OptionSource::Sessions).unwrap(),
+            "\"sessions\""
+        );
+        assert_eq!(
+            serde_json::from_str::<OptionSource>("\"sessions\"").unwrap(),
+            OptionSource::Sessions
+        );
+    }
+
+    #[test]
+    fn dynamic_select_sessions_with_empty_depends_on_validates() {
+        // An object_list dynamic_select field sourced from `sessions` needs no
+        // dependency (unlike acp.models/modes): empty depends_on must validate.
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 15\n\n\
+             [[settings]]\nkey = \"servers\"\ntype = \"object_list\"\nitem_id_key = \"id\"\n\n\
+             [[settings.fields]]\nkey = \"session_id\"\ntype = \"dynamic_select\"\noption_source = \"sessions\"\n";
+        let m = PluginManifest::from_toml_str(toml).expect("sessions dynamic_select parses");
+        assert_eq!(
+            m.settings[0].fields[0].option_source,
+            Some(OptionSource::Sessions)
+        );
+        assert!(m.settings[0].fields[0].depends_on.is_empty());
+
+        // The same at top level also validates with an empty depends_on.
+        let top = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 15\n\n\
+             [[settings]]\nkey = \"session\"\ntype = \"dynamic_select\"\noption_source = \"sessions\"\n";
+        let m = PluginManifest::from_toml_str(top).expect("top-level sessions select parses");
+        assert_eq!(m.settings[0].option_source, Some(OptionSource::Sessions));
+    }
+
+    #[test]
+    fn sessions_option_source_requires_v15() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 14\n\n\
+             [[settings]]\nkey = \"session\"\ntype = \"dynamic_select\"\noption_source = \"sessions\"\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("api_version >= 15"), "{err}");
+    }
+
+    #[test]
+    fn password_setting_type_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&SettingType::Password).unwrap(),
+            "\"password\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SettingType>("\"password\"").unwrap(),
+            SettingType::Password
+        );
+        // A password setting parses and validates like a string field.
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 15\n\n\
+             [[settings]]\nkey = \"token\"\ntype = \"password\"\n";
+        let m = PluginManifest::from_toml_str(toml).expect("password setting parses");
+        assert_eq!(m.settings[0].value_type, SettingType::Password);
+    }
+
+    #[test]
+    fn password_object_field_type_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&ObjectFieldType::Password).unwrap(),
+            "\"password\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ObjectFieldType>("\"password\"").unwrap(),
+            ObjectFieldType::Password
+        );
+        // A password object-list item field parses and validates like a string.
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 15\n\n\
+             [[settings]]\nkey = \"servers\"\ntype = \"object_list\"\nitem_id_key = \"id\"\n\n\
+             [[settings.fields]]\nkey = \"token\"\ntype = \"password\"\n";
+        let m = PluginManifest::from_toml_str(toml).expect("password field parses");
+        assert_eq!(
+            m.settings[0].fields[0].value_type,
+            ObjectFieldType::Password
+        );
+    }
+
+    #[test]
+    fn password_field_type_requires_v15() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 14\n\n\
+             [[settings]]\nkey = \"token\"\ntype = \"password\"\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("api_version >= 15"), "{err}");
     }
 
     #[test]

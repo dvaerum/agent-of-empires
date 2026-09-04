@@ -77,6 +77,7 @@ pub async fn resolve_option_source(
         }
         OptionSource::Projects => project_options(&state.profile).await,
         OptionSource::Groups => Ok(group_options(state).await),
+        OptionSource::Sessions => Ok(session_options(state).await),
     }
 }
 
@@ -228,6 +229,28 @@ async fn project_options(profile: &str) -> anyhow::Result<Vec<SelectOption>> {
         .collect())
 }
 
+/// The operator's live sessions as `{value: <id>, label: "<title> (<id>)"}`.
+/// Archived and trashed sessions are excluded, matching what the dashboard's
+/// default session list shows; the label falls back to the bare id when a
+/// session has no title yet. Sorted by title then id for a stable picker.
+async fn session_options(state: &Arc<AppState>) -> Vec<SelectOption> {
+    let instances = state.instances.read().await;
+    let mut opts: Vec<SelectOption> = instances
+        .iter()
+        .filter(|i| !i.is_archived() && !i.is_trashed())
+        .map(|i| {
+            let label = if i.title.trim().is_empty() {
+                i.id.clone()
+            } else {
+                format!("{} ({})", i.title, i.id)
+            };
+            SelectOption::new(&i.id, &label)
+        })
+        .collect();
+    opts.sort_by(|a, b| a.label.cmp(&b.label).then(a.value.cmp(&b.value)));
+    opts
+}
+
 async fn group_options(state: &Arc<AppState>) -> Vec<SelectOption> {
     let instances = state.instances.read().await;
     let mut paths: Vec<String> = instances
@@ -288,6 +311,42 @@ mod tests {
             groups.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
             vec!["work/backend"]
         );
+    }
+
+    #[tokio::test]
+    async fn resolves_sessions_excluding_archived_and_trashed() {
+        let live = Instance::new("Backend work", "/tmp/p");
+        let live_id = live.id.clone();
+        let mut archived = Instance::new("Old", "/tmp/q");
+        archived.archived_at = Some(chrono::Utc::now());
+        let mut trashed = Instance::new("Gone", "/tmp/r");
+        trashed.trashed_at = Some(chrono::Utc::now());
+        // A live session with no title falls back to the bare id as its label.
+        let untitled = Instance::new("", "/tmp/s");
+        let untitled_id = untitled.id.clone();
+
+        let state = crate::server::test_support::build_test_app_state(vec![
+            live, archived, trashed, untitled,
+        ]);
+
+        let sessions = resolve_option_source(&state, OptionSource::Sessions, &[])
+            .await
+            .expect("sessions");
+
+        // Only the two live sessions surface; archived/trashed are excluded.
+        assert_eq!(sessions.len(), 2);
+        // value is the session id; label is "<title> (<id>)" (or bare id when
+        // the session has no title yet).
+        let titled = sessions
+            .iter()
+            .find(|o| o.value == live_id)
+            .expect("live session present");
+        assert_eq!(titled.label, format!("Backend work ({live_id})"));
+        let untitled = sessions
+            .iter()
+            .find(|o| o.value == untitled_id)
+            .expect("untitled session present");
+        assert_eq!(untitled.label, untitled_id);
     }
 
     #[test]

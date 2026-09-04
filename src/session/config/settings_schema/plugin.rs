@@ -140,6 +140,9 @@ fn widget_and_validation(s: &SettingContribution) -> (WidgetKind, ValidationKind
             },
             ValidationKind::None,
         ),
+        // A password is a string with a masked widget; storage/validation are
+        // identical to a plain string (the value is still just a string).
+        SettingType::Password => (WidgetKind::Password, ValidationKind::None),
         SettingType::Integer => {
             let widget = WidgetKind::Number {
                 min: s.min,
@@ -218,6 +221,16 @@ fn object_field_descriptor(f: &aoe_plugin_api::ObjectFieldContribution) -> Objec
                 multiline: f.multiline,
                 mono: false,
             },
+            if f.required {
+                ValidationKind::NonEmptyString
+            } else {
+                ValidationKind::StringValue
+            },
+        ),
+        // A password is a string with a masked widget; validate it exactly like
+        // a string field (non-empty when required, otherwise just the type).
+        T::Password => (
+            ObjectFieldWidget::Password,
             if f.required {
                 ValidationKind::NonEmptyString
             } else {

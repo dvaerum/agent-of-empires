@@ -419,7 +419,9 @@ fn value_from_json(widget: &WidgetKind, current: Option<&Value>) -> FieldValue {
     let current = current.unwrap_or(&null);
     match widget {
         WidgetKind::Toggle => FieldValue::Bool(current.as_bool().unwrap_or(false)),
-        WidgetKind::Text { .. } => FieldValue::Text(current.as_str().unwrap_or("").to_string()),
+        WidgetKind::Text { .. } | WidgetKind::Password => {
+            FieldValue::Text(current.as_str().unwrap_or("").to_string())
+        }
         WidgetKind::OptionalText { .. } => {
             FieldValue::OptionalText(current.as_str().map(|s| s.to_string()))
         }
@@ -595,7 +597,7 @@ fn schema_value_to_json(
 ) -> Value {
     match (widget, value) {
         (WidgetKind::Toggle, FieldValue::Bool(b)) => json!(b),
-        (WidgetKind::Text { .. }, FieldValue::Text(s)) => json!(s),
+        (WidgetKind::Text { .. } | WidgetKind::Password, FieldValue::Text(s)) => json!(s),
         (WidgetKind::OptionalText { .. }, FieldValue::OptionalText(Some(s))) => json!(s),
         (WidgetKind::OptionalText { .. }, FieldValue::OptionalText(None)) => Value::Null,
         (WidgetKind::Number { .. } | WidgetKind::Slider { .. }, FieldValue::Number(n)) => {
