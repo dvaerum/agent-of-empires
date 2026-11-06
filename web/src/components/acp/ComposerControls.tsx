@@ -1,6 +1,6 @@
 // Composer footer controls: toolbar, mode picker, usage hint, attachments, send/stop, popover list.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ComposerPrimitive, useAui } from "@assistant-ui/react";
 import { ChevronUp, Paperclip, ShieldCheck, Square, X } from "lucide-react";
 
@@ -149,6 +149,41 @@ const MODE_TONES: [RegExp, string][] = [
 ];
 const DEFAULT_MODE_TONE = "border-surface-700 bg-surface-800 text-text-secondary hover:border-surface-600";
 
+// Direction-aware clamp for the mode menu, mirroring SessionConfigControls'
+// computeMenuLayout (upstream #3747): open upward when there's a floor's
+// worth of room, else toward the roomier side, and always cap height to the
+// space actually available so a long mode list can't clip off the viewport.
+// Kept as a scoped equivalent rather than importing that function, since its
+// constants (menu width, caps) are tuned to the model dropdown, not this menu.
+const MODE_MENU_MAX_HEIGHT = 256;
+const MODE_MENU_MIN_HEIGHT = 120;
+const MODE_MENU_VIEWPORT_MARGIN = 8;
+
+interface ModeMenuLayout {
+  direction: "up" | "down";
+  maxHeight: number;
+}
+
+const DEFAULT_MODE_MENU_LAYOUT: ModeMenuLayout = { direction: "up", maxHeight: MODE_MENU_MAX_HEIGHT };
+
+function computeModeMenuLayout(rect: DOMRect, viewportHeight: number, viewportTop = 0): ModeMenuLayout {
+  const spaceAbove = rect.top - viewportTop - MODE_MENU_VIEWPORT_MARGIN;
+  const spaceBelow = viewportTop + viewportHeight - rect.bottom - MODE_MENU_VIEWPORT_MARGIN;
+  let direction: "up" | "down";
+  let available: number;
+  if (spaceAbove >= MODE_MENU_MIN_HEIGHT) {
+    direction = "up";
+    available = spaceAbove;
+  } else if (spaceBelow >= MODE_MENU_MIN_HEIGHT || spaceBelow > spaceAbove) {
+    direction = "down";
+    available = spaceBelow;
+  } else {
+    direction = "up";
+    available = spaceAbove;
+  }
+  return { direction, maxHeight: Math.max(0, Math.min(MODE_MENU_MAX_HEIGHT, available)) };
+}
+
 export function ModePicker({
   sessionId,
   availableModes,
@@ -168,6 +203,7 @@ export function ModePicker({
 }) {
   const profile = useAgentProfile();
   const [open, setOpen] = useState(false);
+  const [menuLayout, setMenuLayout] = useState<ModeMenuLayout>(DEFAULT_MODE_MENU_LAYOUT);
   const ref = useRef<HTMLDivElement | null>(null);
   // Each channel (config option, SessionModeState, claude fallback) pairs with its own write path.
   const channel = resolveModeChannel({
@@ -192,6 +228,28 @@ export function ModePicker({
     return () => {
       document.removeEventListener("mousedown", onClick);
       document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  // visualViewport events catch the soft keyboard, which fires no window resize.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const vv = typeof window !== "undefined" ? window.visualViewport : null;
+    const recompute = () => {
+      const rect = ref.current?.getBoundingClientRect();
+      if (!rect) return;
+      setMenuLayout(computeModeMenuLayout(rect, vv?.height ?? window.innerHeight, vv?.offsetTop ?? 0));
+    };
+    recompute();
+    window.addEventListener("resize", recompute);
+    window.addEventListener("scroll", recompute, true);
+    vv?.addEventListener("resize", recompute);
+    vv?.addEventListener("scroll", recompute);
+    return () => {
+      window.removeEventListener("resize", recompute);
+      window.removeEventListener("scroll", recompute, true);
+      vv?.removeEventListener("resize", recompute);
+      vv?.removeEventListener("scroll", recompute);
     };
   }, [open]);
 
@@ -223,8 +281,12 @@ export function ModePicker({
       </button>
       {open && (
         <div
-          className="absolute bottom-full left-0 z-30 mb-1 w-56 overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
+          className={[
+            "absolute left-0 z-30 w-56 overflow-y-auto rounded-md border border-surface-700 bg-surface-850 shadow-xl",
+            menuLayout.direction === "up" ? "bottom-full mb-1" : "top-full mt-1",
+          ].join(" ")}
           role="menu"
+          style={{ maxHeight: menuLayout.maxHeight }}
         >
           <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
             {channel.label}
