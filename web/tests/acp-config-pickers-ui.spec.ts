@@ -234,3 +234,49 @@ for (const height of [800, 320]) {
     await expect(search).toBeFocused();
   });
 }
+
+// The composer's mode picker (ComposerControls.tsx) has its own always-upward
+// menu, unrelated to the model dropdown above: it needs its own viewport clamp.
+function longModeOption(count: number) {
+  return {
+    id: "mode",
+    name: "Agent Modes",
+    category: "mode",
+    current_value: "mode-1",
+    options: Array.from({ length: count }, (_, i) => ({
+      value: `mode-${i + 1}`,
+      name: `Mode ${i + 1}`,
+    })),
+  };
+}
+
+test("long mode list stays in the viewport and scrolls on short screens", async ({ page }) => {
+  // Same clipping hazard as the model dropdown: the composer's mode menu
+  // also opens upward and used to extend past the top of the viewport.
+  await page.setViewportSize({ width: 320, height: 568 });
+  const mock = await mockAcpSession(page, {
+    title: "ui-pickers-long-mode",
+    initialEvents: [configOptionsUpdated([longModeOption(20)])],
+  });
+  await openStructuredSession(page, mock);
+
+  const modePicker = page.locator('[data-tour="acp-mode-picker"]');
+  await expect(modePicker).toBeVisible({ timeout: 15_000 });
+  await modePicker.getByRole("button").click();
+
+  const menu = page.getByRole("menu");
+  await expect(menu).toBeVisible();
+
+  const fitsViewport = () => menu.boundingBox().then((box) => Boolean(box && box.y >= 0 && box.y + box.height <= 568));
+  await expect.poll(fitsViewport).toBe(true);
+  expect(await menu.evaluate((el) => getComputedStyle(el).overflowY)).toBe("auto");
+
+  const first = page.getByRole("menuitem", { name: "Mode 1", exact: true });
+  await expect.poll(() => first.boundingBox().then((b) => Boolean(b && b.y >= 0 && b.y <= 568))).toBe(true);
+
+  const last = page.getByRole("menuitem", { name: "Mode 20", exact: true });
+  await menu.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect.poll(() => last.boundingBox().then((b) => Boolean(b && b.y >= 0 && b.y <= 568))).toBe(true);
+});
