@@ -85,6 +85,8 @@ function renderField(
       );
     case "optional_text":
       return <TextField key={d.field} {...common} value={str} onChange={(v) => save(v || null)} mono={widget.mono} />;
+    case "password":
+      return <TextField key={d.field} {...common} value={str} onChange={(v) => save(v)} password />;
     case "number":
       return (
         <NumberField
