@@ -18,4 +18,4 @@ pub use manifest::{
 
 /// Current manifest schema and host API version. The host rejects newer
 /// manifests. Version history is documented in `docs/plugin-api.md`.
-pub const API_VERSION: u32 = 21;
+pub const API_VERSION: u32 = 22;

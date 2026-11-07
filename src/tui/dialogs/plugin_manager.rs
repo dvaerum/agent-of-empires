@@ -324,6 +324,7 @@ fn setting_type_label(t: aoe_plugin_api::SettingType) -> &'static str {
         aoe_plugin_api::SettingType::ObjectList => "object_list",
         aoe_plugin_api::SettingType::Cron => "cron",
         aoe_plugin_api::SettingType::StringList => "string_list",
+        aoe_plugin_api::SettingType::Password => "password",
     }
 }
 
