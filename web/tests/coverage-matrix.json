@@ -4745,6 +4745,13 @@
       "notes": "Keyboard open, Escape returns focus, Copy takes claude auth login, Open Terminal shows the host paired shell, Restart Agent posts once; read-only and CityHall servers show only the command. A sandboxed Session's open Host shell switches to a focused Container shell, and a collapsed dock whose active tab is the terminal is revealed."
     },
     {
+      "id": "acp.seed-replay-no-wedge",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-seed-replay-no-wedge.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "story.wizard-open-close",
       "kind": "mocked-playwright",
       "risk": "low",
