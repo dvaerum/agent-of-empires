@@ -37,6 +37,21 @@ use crate::acp::acp_client::session_identity::ordered_session_request;
 /// Fully silent grace after reattaching to an in-flight turn.
 const RESUME_IDLE_GRACE_DEFAULT: Duration = Duration::from_secs(30);
 
+/// After `session/load` returns, its history replay is complete on the wire:
+/// the adapter replays the whole transcript BEFORE answering `session/load`.
+/// On the direct ACP path the incoming actor processes messages sequentially
+/// and awaits the notification handler inline, so every replayed event is
+/// already enqueued on `event_tx` before the response resolves; the stream is
+/// immediately quiet. On the v2 runner path the replay events and the load
+/// response travel on two different sockets (the main byte-relay vs the
+/// control channel), so a few relayed events can still be in flight when the
+/// control response lands. Wait for this short quiet window to absorb that
+/// cross-channel lag before closing the seeded replay's phantom turns; capped
+/// by [`REPLAY_SETTLE_DRAIN_MAX`] so a stuck relay can't hold the turn open
+/// forever.
+const REPLAY_SETTLE_DRAIN_QUIET: Duration = Duration::from_millis(400);
+const REPLAY_SETTLE_DRAIN_MAX: Duration = Duration::from_secs(3);
+
 /// Announced when `session/new` replaces a conversation the user expects to
 /// continue. `stored` is absent after a view switch that lost the id.
 fn initial_reset_reason(
@@ -297,6 +312,50 @@ fn spawn_resume_idle_watchdog(shared: Arc<Shared>) {
     });
 }
 
+/// Terminal->structured (and any Fresh/imported load that SEEDS an empty
+/// event store) replays the transcript via `session/load` with suppression
+/// OFF, so replayed `UserMessageChunk`s become `UserPromptSent` and open
+/// turns that the historical replay never closes with a `Stopped`.
+/// `turnActive` then sticks and the view wedges at "waiting for model..."
+/// forever. This is NOT an opencode protocol gap (a normal reattach
+/// suppresses the same replay, so it never wedges): it is specific to the
+/// seed path, where we deliberately let the replay through to populate the
+/// store. Close it deterministically once `session/load` returns (the
+/// adapter replays the whole transcript before answering), instead of a
+/// blind quiet-timer watchdog armed on every connect. This is a separate
+/// concern from `spawn_resume_idle_watchdog` above (an in-flight `Resume`,
+/// not a seeded `Fresh`).
+fn spawn_replay_settle_watchdog(shared: Arc<Shared>) {
+    let deadline = tokio::time::Instant::now() + REPLAY_SETTLE_DRAIN_MAX;
+    let quiet_ms = REPLAY_SETTLE_DRAIN_QUIET.as_millis() as i64;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if shared.terminal_claim.claimed()
+                || shared.prompt_sent_since_attach.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            let quiet = now_ms() - shared.last_event_at.load(Ordering::Relaxed) >= quiet_ms;
+            if quiet || tokio::time::Instant::now() >= deadline {
+                if shared.terminal_claim.claim() {
+                    info!(
+                        target: "acp.protocol",
+                        session = %shared.session_label,
+                        "replay-settle: session/load returned; closing seeded replay phantom turns"
+                    );
+                    shared
+                        .emit(Event::Stopped {
+                            reason: "replay_settle".into(),
+                        })
+                        .await;
+                }
+                return;
+            }
+        }
+    });
+}
+
 impl Session {
     /// A request that mints a new native session: sent by the runner when one
     /// is attached, else over the crate connection. Updates the agent sends
@@ -498,6 +557,13 @@ impl Session {
                         .await;
                     if let Some(event) = config_options_event(resp.config_options) {
                         self.shared.emit(event).await;
+                    }
+                    // Close the seeded replay's phantom turns: see
+                    // `spawn_replay_settle_watchdog`. Disarms itself if the
+                    // user already sent a prompt (its own turn owns the next
+                    // `Stopped`) or another path claimed the terminal event.
+                    if seed_history_replay {
+                        spawn_replay_settle_watchdog(self.shared.clone());
                     }
                     return Ok(SessionId::from(stored));
                 }

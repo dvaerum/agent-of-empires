@@ -543,3 +543,108 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
         let _ = fake.agent.await;
     }
 }
+
+/// fix/opencode-replay-settle-wedge: a seeded `session/load` replay (e.g. a
+/// terminal->structured switch, or an import/fork) opens a phantom turn via
+/// `UserMessageChunk -> UserPromptSent` that the historical replay itself
+/// never closes with a `Stopped`. Without the fix the structured view wedges
+/// at "waiting for model..." forever; `spawn_replay_settle_watchdog` closes
+/// it once `session/load` returns and the replay has gone quiet.
+#[tokio::test]
+async fn seeded_load_replay_settles_its_phantom_turn() {
+    let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
+    let (mut agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (_cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_path_buf();
+    let params = ConnectionParams {
+        claude_home: None,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        event_tx,
+        cmd_rx,
+        child: None,
+        pending_responders: Arc::new(Mutex::new(HashMap::new())),
+        resources: SessionResources {
+            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+            terminals: TerminalManager::new(),
+            cwd,
+            label: "s-replay".to_string(),
+            sandbox: None,
+        },
+        mode: ConnectMode::Fresh {
+            stored_acp_session_id: Some("s-replay".to_string()),
+            seed_history_replay: true,
+            prior_conversation: false,
+            fork_from: None,
+        },
+        ready_tx,
+        profile: &crate::acp::agent_profiles::GEMINI,
+        expected_agent: ExpectedAgent::Gemini,
+        source_profile: None,
+        default_effort: None,
+        default_mode: None,
+        default_model: None,
+        mcp_servers: Vec::new(),
+        runner: None,
+    };
+    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+    let connection = tokio::spawn(run_connection_task(transport, params));
+
+    // The fake agent advertises `loadSession` and, on `session/load`, writes
+    // one replayed historical user turn before answering -- mirroring the
+    // real adapter's "replay the whole transcript, then answer" ordering.
+    let agent = tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let id = &msg["id"];
+            let out = match msg["method"].as_str() {
+                Some("initialize") => vec![format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true}}}}}}"#
+                )],
+                Some("session/load") => vec![
+                    r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-replay","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"replayed prompt"}}}}"#.to_string(),
+                    format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{}}}}"#),
+                ],
+                _ => vec![],
+            };
+            for line in out {
+                agent_write
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    ready_rx
+        .await
+        .expect("handshake completes")
+        .expect("handshake ok");
+
+    // The phantom turn opens (UserPromptSent from the replayed chunk) and is
+    // then retired by the deterministic `Stopped { replay_settle }`, with no
+    // prompt ever sent locally.
+    let mut saw_prompt_sent = false;
+    let stopped_reason = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match event_rx.recv().await.expect("connection remains open") {
+                Event::UserPromptSent { .. } => saw_prompt_sent = true,
+                Event::Stopped { reason } => break reason,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("replay-settle Stopped must land once session/load's replay goes quiet");
+
+    assert!(saw_prompt_sent, "the seeded replay must open a turn first");
+    assert_eq!(stopped_reason, "replay_settle");
+
+    agent.abort();
+    connection.abort();
+    let _ = tokio::join!(agent, connection);
+}
