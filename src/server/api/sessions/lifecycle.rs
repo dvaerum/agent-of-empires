@@ -1330,6 +1330,11 @@ pub(super) enum LifecycleTargetError {
     /// An archived or trashed session refuses to launch or resume (#4116).
     #[error(transparent)]
     Blocked(#[from] crate::session::StartBlocked),
+    /// Opening a Stopped session must not auto-launch its agent when the user
+    /// turned off `resume_stopped_on_open`; see the check site for why only
+    /// `Stopped` (not `Error`/crash-recovery) is gated.
+    #[error("resume-on-open is disabled for this stopped session")]
+    ResumeOnOpenDisabled,
 }
 
 pub(crate) fn lifecycle_rejection(
@@ -1352,6 +1357,13 @@ pub(crate) fn lifecycle_rejection(
                 StatusCode::CONFLICT,
                 "not_structured",
                 "Switch the session to structured view before stopping an ACP worker",
+            ))
+        }
+        Some(LifecycleTargetError::ResumeOnOpenDisabled) => {
+            return Some(api_error(
+                StatusCode::CONFLICT,
+                "resume_on_open_disabled",
+                "Session is stopped. Use Start to run it (resume-on-open is off).",
             ))
         }
         _ => {}
@@ -2954,6 +2966,20 @@ async fn prepare_agent_session_inner(
                     );
                     if super::ensure::ready_agent_session(row)?.is_some() {
                         return Ok(None);
+                    }
+                    // `ready_agent_session` returning None here means the pane is
+                    // dead or absent. For a deliberately/genuinely Stopped row
+                    // that just means "not running" -- refuse rather than
+                    // auto-launch when the user turned resume-on-open off. The
+                    // explicit Start action remains the only launcher; crash
+                    // recovery is unaffected because only `Stopped` is gated (a
+                    // crashed running agent is `Error`, not `Stopped`).
+                    if row.status == Status::Stopped
+                        && !crate::session::config::profile_config::resolve_config_or_warn(&profile)
+                            .session
+                            .resume_stopped_on_open
+                    {
+                        return Err(LifecycleTargetError::ResumeOnOpenDisabled.into());
                     }
                 } else if row.status != Status::Stopped {
                     return Ok(None);
