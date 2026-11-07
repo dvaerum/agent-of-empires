@@ -14,7 +14,7 @@ use super::reload::{
 use super::session_identity::drain_session_id_updates_in_state;
 use super::sleep_inhibit::update_sleep_inhibit;
 use super::state::{AppState, StatusSource};
-use super::structured_repair::live_structured_worker_records;
+use super::structured_repair::{live_structured_worker_ids, live_structured_worker_records};
 use crate::server::acp_reconciler;
 
 /// What to do with one instance's status_poll_loop diff, once a genuine
@@ -496,6 +496,10 @@ pub(super) async fn status_poll_loop(
                     "holding tmux-backed statuses because pane metadata is unavailable",
                 );
             }
+            // Live worker ids (all, including pre-handshake) so a row whose
+            // disk `view` still reads Terminal but whose ACP worker is up skips
+            // the tmux status decision. See `apply_tick_status_decisions`.
+            let live_worker_ids = live_structured_worker_ids();
             apply_tick_status_decisions(
                 &mut loaded.instances,
                 &mut prev,
@@ -503,6 +507,7 @@ pub(super) async fn status_poll_loop(
                 &suppressed_ids,
                 pane_metadata.as_ref().ok(),
                 &sandbox_health,
+                &live_worker_ids,
             );
             if let Ok(metadata) = &metadata {
                 super::pane::seed_pending_tool_targets(&mut loaded.instances, &pending);

@@ -796,6 +796,7 @@ pub(super) fn apply_tick_status_decisions(
     suppressed_ids: &std::collections::HashSet<String>,
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
     sandbox_health: &std::collections::HashMap<String, SandboxHealth>,
+    live_worker_ids: &std::collections::HashSet<String>,
 ) {
     let now = chrono::Utc::now();
     for inst in instances {
@@ -809,6 +810,7 @@ pub(super) fn apply_tick_status_decisions(
             suppressed,
             pane_metadata,
             Some(sandbox_health),
+            live_worker_ids,
             now,
         );
         if let (Some(previous), Some(baseline)) = (previous, baseline) {
@@ -824,6 +826,7 @@ fn apply_tick_status_decision(
     suppressed: bool,
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
     sandbox_health: Option<&std::collections::HashMap<String, SandboxHealth>>,
+    live_worker_ids: &std::collections::HashSet<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<Status> {
     if inst.status == Status::Creating {
@@ -853,6 +856,23 @@ fn apply_tick_status_decision(
         return baseline;
     }
     if skip_tmux_decision_for_structured(inst) {
+        return baseline;
+    }
+    // A row with a live ACP worker is structured for status purposes even
+    // when its on-disk `view` still reads Terminal. That mismatch is a real
+    // window: `acp_enable` persists `view = Structured` before spawning, but
+    // the write can fail (logged, not retried) or a pre-handshake row's
+    // worker record carries no `stored_acp_session_id` yet, so
+    // `repair_structured_rows_from_live_workers` cannot heal `view` this
+    // tick. During that window a leftover/re-spawned agent pane (e.g. an
+    // opencode pane recreated by the terminal websocket) would otherwise
+    // drive tmux status detection and mint the exact phantom
+    // `skip_tmux_decision_for_structured` guards against. Gating on the live
+    // worker registry closes it at the source, independent of disk `view`.
+    if live_worker_ids.contains(&inst.id) {
+        if let Some(live) = baseline {
+            inst.status = live;
+        }
         return baseline;
     }
     if inst.has_fresh_lifecycle_reservation(now)
@@ -983,6 +1003,7 @@ pub(super) fn apply_supplementary_tick(
             false,
             pane_metadata,
             None,
+            &std::collections::HashSet::new(),
             now,
         );
     }
@@ -1874,6 +1895,7 @@ mod tests {
                         &std::collections::HashSet::new(),
                         None,
                         &Default::default(),
+                        &std::collections::HashSet::new(),
                     );
                     let row = loaded.instances.iter().find(|row| row.id == id).unwrap();
                     assert_eq!(
@@ -2444,6 +2466,7 @@ mod tests {
             &std::collections::HashSet::new(),
             Some(&std::collections::HashMap::new()),
             &Default::default(),
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -2551,10 +2574,53 @@ mod tests {
                 false,
                 None,
                 None,
+                &std::collections::HashSet::new(),
                 now,
             );
             assert_eq!(instance.status, expected, "{case}");
         }
+    }
+
+    #[test]
+    fn tick_skips_tmux_for_a_disk_terminal_row_with_a_live_worker() {
+        // The terminal<->structured round-trip bug. `acp_enable` persisted
+        // `view = Structured` but the disk write was lost (or the row is
+        // pre-handshake), so this row loads from disk as Terminal even though
+        // its ACP worker is live. A leftover/re-spawned agent pane would drive
+        // tmux detection to `Running` and mint a phantom `Idle -> Running`
+        // transition every tick. The live-worker set must force the tmux
+        // decision to be skipped and the live baseline carried, exactly as a
+        // disk-structured row would be, so no transition is reported.
+        let mut inst = Instance::new("acp-session", "/tmp/test");
+        // Disk view is Terminal (not structured) despite a live worker.
+        assert!(!inst.is_structured());
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        let mut prev = std::collections::HashMap::from([(id.clone(), Status::Idle)]);
+        let live_workers = std::collections::HashSet::from([id.clone()]);
+        let mut instances = vec![inst];
+
+        apply_tick_status_decisions(
+            &mut instances,
+            &mut prev,
+            &Default::default(),
+            &std::collections::HashSet::new(),
+            Some(&std::collections::HashMap::new()),
+            &Default::default(),
+            &live_workers,
+        );
+
+        assert_eq!(
+            instances[0].status,
+            Status::Idle,
+            "the live acp baseline is authoritative for a row with a live worker"
+        );
+        assert_eq!(
+            observed_transitions(&instances, &prev),
+            vec![],
+            "a disk-Terminal row with a live worker must not report a phantom \
+             transition from a leftover tmux pane"
+        );
     }
 
     #[test]
@@ -2571,6 +2637,7 @@ mod tests {
             &std::collections::HashSet::new(),
             Some(&std::collections::HashMap::new()),
             &Default::default(),
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(instances[0].status, Status::Idle, "disk status stands");
@@ -2599,6 +2666,7 @@ mod tests {
             &std::collections::HashSet::from([id]),
             Some(&std::collections::HashMap::new()),
             &Default::default(),
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(instances[0].status, Status::Starting);
@@ -2632,6 +2700,7 @@ mod tests {
                 &std::collections::HashSet::new(),
                 None,
                 &Default::default(),
+                &std::collections::HashSet::new(),
             );
 
             assert_eq!(instances[0].status, live, "disk status was {disk:?}");
@@ -2724,6 +2793,7 @@ mod tests {
                 &Default::default(),
                 None,
                 &health,
+                &std::collections::HashSet::new(),
             );
             merge_loaded_rows(
                 &mut canonical,
@@ -2905,6 +2975,7 @@ mod tests {
                 &std::collections::HashSet::new(),
                 Some(&metadata),
                 &Default::default(),
+                &std::collections::HashSet::new(),
             );
             tracking = instances
                 .iter()
@@ -2981,6 +3052,7 @@ mod tests {
             &std::collections::HashSet::new(),
             Some(&metadata),
             &Default::default(),
+            &std::collections::HashSet::new(),
         );
         assert_eq!(instances[0].status, Status::Idle);
         assert_ne!(
