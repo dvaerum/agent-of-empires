@@ -345,9 +345,21 @@ export function MobileLiveTerminal({
     scheduleViewSync,
   });
 
-  // A tap raises the keyboard; focus() must stay synchronous for iOS. A click ending a selection is left alone.
+  // Desktop-only: clicking anywhere on the terminal focuses it so typing
+  // works without hunting for the exact input. On touch, this used to also
+  // pop the soft keyboard on any tap (including just scrolling through
+  // history) — surprising, and redundant with the keyboard FAB (KeyboardFab,
+  // rendered only on coarse pointers, see LiveTerminalView) which already
+  // gives an explicit show/hide toggle. The focus() must be synchronous
+  // inside the click handler for iOS to honor the user-gesture requirement
+  // for showing the keyboard, so nothing async runs before it. The
+  // active-element check skips a redundant re-focus when the keyboard is
+  // already up, and a click that ends a text selection is left alone so
+  // select-to-copy still works. The FAB and "Back to live" button are
+  // siblings of the scroller, not descendants, so tapping them never reaches
+  // this handler.
   const focusInputOnTap = useCallback(() => {
-    if (readOnly) return;
+    if (coarse) return;
     if (suppressTouchClickRef.current) {
       suppressTouchClickRef.current = false;
       return;
@@ -356,7 +368,7 @@ export function MobileLiveTerminal({
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed) return;
     inputRef.current?.focus();
-  }, [inputRef, readOnly]);
+  }, [inputRef, coarse]);
 
   // A viewport point as a 1-based pane-0 cell, measured from the (possibly bottom-aligned) rendered content.
   const pointerCell = useCallback(
