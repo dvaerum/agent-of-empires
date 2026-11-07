@@ -105,6 +105,40 @@ pub(crate) fn wrap_in_scope(
     wrapped
 }
 
+/// Applies `AOE_ACP_RUNNER_ENV_FILE` (a `KEY=value`-per-line dotenv file) to
+/// `cmd`, when set. Must run before [`wrap_in_scope`]: that function only
+/// carries over env vars already present on `cmd` into the scoped process, so
+/// setting these here is what lets them reach a systemd-scoped runner without
+/// an external wrapper. A missing/unset file is a no-op; most deployments
+/// don't set this. A malformed file is logged and otherwise ignored, since
+/// this is optional, best-effort configuration, not load-bearing for spawn.
+fn apply_runner_env_file(cmd: &mut tokio::process::Command) {
+    let Some(path) = std::env::var_os("AOE_ACP_RUNNER_ENV_FILE") else {
+        return;
+    };
+    match dotenv_ng_core::EnvLoader::with_path(&path)
+        .required(false)
+        .sequence(dotenv_ng_core::EnvSequence::InputOnly)
+        .substitution(false)
+        .multiline(true)
+        .load()
+    {
+        Ok(vars) => {
+            for (key, value) in vars {
+                cmd.env(key, value);
+            }
+        }
+        Err(error) => {
+            warn!(
+                target: "acp.protocol.spawn",
+                path = %std::path::Path::new(&path).display(),
+                %error,
+                "AOE_ACP_RUNNER_ENV_FILE could not be parsed; runner env left unchanged",
+            );
+        }
+    }
+}
+
 /// The runner log opened for appending, with the runner's own 0600 mode, or
 /// null when it cannot be opened.
 fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
@@ -441,6 +475,7 @@ pub(super) async fn spawn_runner_detached(
 
     // Reads the runner env, so it runs before the scope wrapper adds its own.
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
+    apply_runner_env_file(&mut cmd);
     let mut cmd = match &prefix {
         Some(prefix) => wrap_in_scope(cmd, prefix),
         None => cmd,
@@ -684,6 +719,46 @@ mod tests {
         let wrapped = wrap_in_scope(original(), &prefix());
         assert_eq!(argv(&wrapped), argv(&original()));
         assert_eq!(envs(&wrapped), envs(&original()));
+    }
+
+    #[test]
+    fn apply_runner_env_file_is_noop_when_unset() {
+        let _guard = EnvGuard::unset(&["AOE_ACP_RUNNER_ENV_FILE"]);
+        let mut cmd = agent();
+        apply_runner_env_file(&mut cmd);
+        assert_eq!(envs(&cmd), vec![pair("A", "1")]);
+    }
+
+    #[test]
+    fn apply_runner_env_file_is_noop_for_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.env");
+        let _guard = EnvGuard::set(&[("AOE_ACP_RUNNER_ENV_FILE", missing.to_str().unwrap())]);
+        let mut cmd = agent();
+        apply_runner_env_file(&mut cmd);
+        assert_eq!(envs(&cmd), vec![pair("A", "1")]);
+    }
+
+    #[test]
+    fn apply_runner_env_file_applies_keyvalue_pairs_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner.env");
+        std::fs::write(
+            &path,
+            "HACKERSPACE_TOKEN=secret-value\n# a comment\n\nHACKERSPACE_USER=bot\n",
+        )
+        .unwrap();
+        let _guard = EnvGuard::set(&[("AOE_ACP_RUNNER_ENV_FILE", path.to_str().unwrap())]);
+        let mut cmd = agent();
+        apply_runner_env_file(&mut cmd);
+        assert_eq!(
+            envs(&cmd),
+            vec![
+                pair("A", "1"),
+                pair("HACKERSPACE_TOKEN", "secret-value"),
+                pair("HACKERSPACE_USER", "bot"),
+            ]
+        );
     }
 
     /// Runs the wrapped command with `env` standing in for `systemd-run` and
