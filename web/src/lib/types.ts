@@ -483,6 +483,9 @@ export type SettingsWidget =
   | { kind: "slider"; min: number; max: number; step: number }
   | { kind: "select"; options: SettingsSelectOption[] }
   | { kind: "list" }
+  /** A secret string, rendered as a masked password input (API v22). */
+  | { kind: "password" }
+  /** A select whose options the host resolves at render time (API v9). */
   | { kind: "dynamic_select"; source: SettingsOptionSource; depends_on?: string[] }
   | {
       kind: "object_list";
@@ -495,11 +498,15 @@ export type SettingsWidget =
   /** Bespoke widget keyed by `id`. */
   | { kind: "custom"; id: string };
 
-export type SettingsOptionSource = "acp_agents" | "acp_models" | "acp_modes" | "projects" | "groups";
+/** Host option source a `dynamic_select` draws from (API v9). Serialized
+ *  snake_case, posted back verbatim to the resolver endpoint. */
+export type SettingsOptionSource = "acp_agents" | "acp_models" | "acp_modes" | "projects" | "groups" | "sessions";
 
 export type SettingsObjectFieldWidget =
   | { kind: "toggle" }
   | { kind: "text"; multiline?: boolean; mono?: boolean }
+  /** A secret string, rendered as a masked password input (API v22). */
+  | { kind: "password" }
   | { kind: "number"; min?: number; max?: number }
   | { kind: "select"; options: SettingsSelectOption[] }
   | { kind: "dynamic_select"; source: SettingsOptionSource; depends_on?: string[] }

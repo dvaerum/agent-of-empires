@@ -213,6 +213,8 @@ function renderItemField(section: string, field: SettingsObjectField, item: Item
           onChange={setField}
         />
       );
+    case "password":
+      return <TextField key={field.field} {...common} value={str(raw)} onChange={setField} password />;
   }
 }
 

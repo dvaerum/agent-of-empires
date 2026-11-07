@@ -166,6 +166,7 @@ export function TextField({
   placeholder,
   mono,
   multiline,
+  password,
 }: {
   label: string;
   description?: string;
@@ -174,6 +175,9 @@ export function TextField({
   placeholder?: string;
   mono?: boolean;
   multiline?: boolean;
+  /** Render a masked secret input (`<input type="password">`, dots by
+   *  default). Ignored when `multiline` is set (a secret is single-line). */
+  password?: boolean;
 }) {
   const draft = useDraft(value, (next) => {
     if (next !== value) onChange(next);
@@ -197,7 +201,7 @@ export function TextField({
         />
       ) : (
         <input
-          type="text"
+          type={password ? "password" : "text"}
           {...draft.props}
           onKeyDown={(e) => {
             if (e.key === "Enter") draft.commit();
