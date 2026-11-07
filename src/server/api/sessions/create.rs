@@ -1426,6 +1426,9 @@ pub(crate) async fn create_session_with(
         parent_session_id: body.parent_session_id,
         cli: body.cli,
         acp_mode_id: None,
+        // Per-session MCP is a plugin-only surface (session.mcp); the REST
+        // create body carries none.
+        session_mcp_servers: Vec::new(),
         view: body.view,
         agent_name: body.agent_name,
         agent_model: body.agent_model,

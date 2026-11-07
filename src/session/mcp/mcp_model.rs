@@ -26,6 +26,15 @@ pub enum McpProvenance {
         name: String,
     },
     ProjectLocal,
+    /// The session's own MCP set, carried on the session record
+    /// (`Instance.session_mcp_servers`) and set at create time (plugin
+    /// `sessions.create` `mcp_servers`) or on a running session via the
+    /// `session.mcp.set` plugin RPC. Highest precedence: a session entry (e.g.
+    /// one named `agent-mcp`) shadows the same name from every config-file
+    /// layer, so each session can authenticate to a remote MCP as its OWN
+    /// identity (its own url + bearer token). Trust anchor is the `session.mcp`
+    /// grant, NOT the repo-trust fingerprint (see [`resolve_effective`]).
+    Session,
     /// Vanished from the agent's native config; shown but not forwarded until kept or dropped.
     KeptOnRemoval {
         agent: String,
@@ -39,6 +48,7 @@ impl McpProvenance {
             McpProvenance::Global => "global".to_string(),
             McpProvenance::Profile { name } => format!("profile:{name}"),
             McpProvenance::ProjectLocal => "project-local".to_string(),
+            McpProvenance::Session => "session".to_string(),
             McpProvenance::KeptOnRemoval { agent } => format!("kept-on-removal:{agent}"),
         }
     }
@@ -167,14 +177,41 @@ fn or_warn<T: Default>(result: Result<T>, source: &str) -> T {
     })
 }
 
-/// The set forwarded to the agent for this session context. Project-local servers
-/// are included only when the repo is trusted at the file's current fingerprint.
+/// Resolve the effective MCP server set for a session context, applying the
+/// full precedence stack: agent-native -> global -> per-profile ->
+/// project-local (trust-gated) -> session, higher wins per name. This is the
+/// single source of truth for BOTH forwarding (the supervisor converts the
+/// winning set to ACP) and the management surfaces (#1996), so what the user
+/// sees equals what the agent receives.
+///
+/// Each config-file layer is isolated: a missing, unreadable, or malformed
+/// source warns and contributes nothing rather than aborting, so a single
+/// broken file never blocks a spawn. `profile` is the session's source profile;
+/// an empty/`None` value resolves to the default. `cwd` is the session working
+/// directory, from which the project-local repo (and its `.mcp.json`) is
+/// resolved. The project-local layer is forwarded ONLY when the repo is trusted
+/// at the file's current fingerprint; an untrusted (or changed) file is skipped
+/// and logged, exactly like the create-time trust gate refuses untrusted hooks.
+///
+/// `session_servers` is the session's OWN set (from `Instance.session_mcp_servers`),
+/// appended as the highest-precedence layer so a session entry shadows the same
+/// name from every config-file layer. It is passed IN, already loaded: the
+/// resolver never does I/O keyed by session id. This layer is TRUST-BY-GRANT —
+/// the `session.mcp` capability grant that let the plugin set it IS the trust
+/// anchor, so it deliberately does NOT run through `is_repo_trusted`. The repo
+/// fingerprint gate exists only for the repo-provided project-local layer (a
+/// repo's `.mcp.json` is a zero-click RCE surface AoE did not author); a session
+/// set is host-side, plugin-authorized data, not repo-provided, so gating it on
+/// the repo fingerprint would be both wrong (it is not the repo's) and broken (a
+/// session server naming a name the repo never had has no repo fingerprint to
+/// match). Do not "fix" this by adding a trust call here.
 pub fn resolve_effective(
     agent_key: &str,
     profile: Option<&str>,
     cwd: &Path,
     session_env: &[(String, String)],
     native_config_override: Option<&Path>,
+    session_servers: &[ProjectMcpServer],
 ) -> Vec<ResolvedMcpServer> {
     let native = load_native_mcp_servers_checked_from_home(
         agent_key,
@@ -208,6 +245,10 @@ pub fn resolve_effective(
         McpLayer {
             provenance: McpProvenance::ProjectLocal,
             servers: or_warn(trusted_project_servers(cwd), "project-local"),
+        },
+        McpLayer {
+            provenance: McpProvenance::Session,
+            servers: session_servers.to_vec(),
         },
     ])
 }
@@ -246,7 +287,10 @@ pub struct McpSurfaceView {
 /// against (and recorded in) the drift store.
 pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSurfaceView {
     let session_env = session_env_for_discovery(profile);
-    let effective = resolve_effective(agent, profile, cwd, &session_env, None);
+    // The management surface renders the config-file layers; the per-session
+    // layer is a forwarding-time concern resolved by the supervisor from the
+    // session record, so pass an empty session set here.
+    let effective = resolve_effective(agent, profile, cwd, &session_env, None, &[]);
     let reconcile = load_native_mcp_servers_checked_from_home(
         agent,
         profile,
@@ -638,7 +682,235 @@ mod tests {
         }
     }
 
-    /// A temp HOME with `CLAUDE_CONFIG_DIR` cleared so a developer's own export is not read.
+    #[test]
+    fn provenance_labels() {
+        assert_eq!(
+            McpProvenance::AgentNative {
+                agent: "claude".into()
+            }
+            .label(),
+            "agent-native:claude"
+        );
+        assert_eq!(McpProvenance::Global.label(), "global");
+        assert_eq!(
+            McpProvenance::Profile {
+                name: "rust".into()
+            }
+            .label(),
+            "profile:rust"
+        );
+        assert_eq!(McpProvenance::ProjectLocal.label(), "project-local");
+        assert_eq!(McpProvenance::Session.label(), "session");
+    }
+
+    #[test]
+    fn resolve_session_layer_overrides_lower_layers() {
+        // A session-layer server shadows a global one of the same name: this is
+        // what lets each session point `agent-mcp` at its own url + token.
+        let merged = resolve(vec![
+            layer(
+                McpProvenance::Global,
+                standard(
+                    r#"{ "mcpServers": { "agent-mcp": { "type": "http", "url": "https://global/mcp" } } }"#,
+                ),
+            ),
+            layer(
+                McpProvenance::Session,
+                standard(
+                    r#"{ "mcpServers": { "agent-mcp": { "type": "http", "url": "https://session/mcp", "headers": { "Authorization": "Bearer session-token" } } } }"#,
+                ),
+            ),
+        ]);
+        assert_eq!(resolved_names(&merged), vec!["agent-mcp"]);
+        assert_eq!(merged[0].provenance, McpProvenance::Session);
+        assert_eq!(merged[0].shadowed, vec![McpProvenance::Global]);
+        match &merged[0].def.transport {
+            ProjectMcpTransport::Http { url, .. } => assert_eq!(url, "https://session/mcp"),
+            other => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_session_layer_unions_distinct_names() {
+        // A session server whose name no lower layer has is added, not gated:
+        // there is no repo fingerprint to match, and none is required — the
+        // session layer is trust-by-grant.
+        let merged = resolve(vec![
+            layer(
+                McpProvenance::Global,
+                standard(r#"{ "mcpServers": { "fs": { "command": "global-fs" } } }"#),
+            ),
+            layer(
+                McpProvenance::Session,
+                standard(
+                    r#"{ "mcpServers": { "agent-mcp": { "type": "http", "url": "https://session/mcp" } } }"#,
+                ),
+            ),
+        ]);
+        assert_eq!(resolved_names(&merged), vec!["agent-mcp", "fs"]);
+    }
+
+    #[test]
+    fn resolve_higher_layer_wins_and_records_shadow() {
+        let merged = resolve(vec![
+            layer(
+                McpProvenance::AgentNative {
+                    agent: "claude".into(),
+                },
+                standard(r#"{ "mcpServers": { "fs": { "command": "native" } } }"#),
+            ),
+            layer(
+                McpProvenance::Global,
+                standard(r#"{ "mcpServers": { "fs": { "command": "global" } } }"#),
+            ),
+        ]);
+        assert_eq!(resolved_names(&merged), vec!["fs"]);
+        assert_eq!(stdio_command(&merged[0].def), "global");
+        assert_eq!(merged[0].provenance, McpProvenance::Global);
+        assert_eq!(
+            merged[0].shadowed,
+            vec![McpProvenance::AgentNative {
+                agent: "claude".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_records_full_shadow_chain_in_precedence_order() {
+        let merged = resolve(vec![
+            layer(
+                McpProvenance::AgentNative {
+                    agent: "claude".into(),
+                },
+                standard(r#"{ "mcpServers": { "fs": { "command": "n" } } }"#),
+            ),
+            layer(
+                McpProvenance::Global,
+                standard(r#"{ "mcpServers": { "fs": { "command": "g" } } }"#),
+            ),
+            layer(
+                McpProvenance::Profile {
+                    name: "rust".into(),
+                },
+                standard(r#"{ "mcpServers": { "fs": { "command": "p" } } }"#),
+            ),
+        ]);
+        assert_eq!(stdio_command(&merged[0].def), "p");
+        assert_eq!(
+            merged[0].provenance,
+            McpProvenance::Profile {
+                name: "rust".into()
+            }
+        );
+        assert_eq!(
+            merged[0].shadowed,
+            vec![
+                McpProvenance::AgentNative {
+                    agent: "claude".into()
+                },
+                McpProvenance::Global,
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_unions_distinct_names_sorted() {
+        let merged = resolve(vec![
+            layer(
+                McpProvenance::AgentNative {
+                    agent: "claude".into(),
+                },
+                standard(
+                    r#"{ "mcpServers": { "zebra": { "command": "z" }, "fs": { "command": "n" } } }"#,
+                ),
+            ),
+            layer(
+                McpProvenance::Global,
+                standard(r#"{ "mcpServers": { "alpha": { "command": "a" } } }"#),
+            ),
+        ]);
+        assert_eq!(resolved_names(&merged), vec!["alpha", "fs", "zebra"]);
+    }
+
+    #[test]
+    fn resolve_empty_is_empty() {
+        assert!(resolve(vec![]).is_empty());
+        assert!(resolve(vec![layer(McpProvenance::Global, Vec::new())]).is_empty());
+    }
+
+    #[test]
+    fn summarize_omits_secret_values() {
+        let merged = resolve(vec![layer(
+            McpProvenance::Global,
+            standard(
+                r#"{ "mcpServers": { "fs": { "command": "c", "env": { "TOKEN": "supersecret" } } } }"#,
+            ),
+        )]);
+        let s = summarize(&merged);
+        assert_eq!(s, "fs(stdio)");
+        assert!(!s.contains("supersecret"));
+    }
+
+    #[test]
+    fn redacted_view_keeps_names_drops_secret_values() {
+        let merged = resolve(vec![
+            layer(
+                McpProvenance::AgentNative {
+                    agent: "claude".into(),
+                },
+                standard(r#"{ "mcpServers": { "fs": { "command": "fs-old" } } }"#),
+            ),
+            layer(
+                McpProvenance::Global,
+                standard(
+                    r#"{ "mcpServers": {
+                        "fs": { "command": "mcp-fs", "args": ["--root", "."], "env": { "TOKEN": "SUPER_SECRET_DO_NOT_LEAK" } },
+                        "remote": { "type": "http", "url": "https://e/mcp", "headers": { "Authorization": "Bearer HEADER_SECRET_DO_NOT_LEAK" } }
+                    } }"#,
+                ),
+            ),
+        ]);
+
+        let stdio = merged
+            .iter()
+            .find(|s| s.def.name == "fs")
+            .unwrap()
+            .redacted();
+        assert_eq!(stdio.transport, "stdio");
+        assert_eq!(stdio.command.as_deref(), Some("mcp-fs"));
+        assert_eq!(stdio.args, vec!["--root", "."]);
+        assert_eq!(stdio.env_names, vec!["TOKEN"]);
+        assert_eq!(stdio.provenance, "global");
+        assert_eq!(stdio.shadowed, vec!["agent-native:claude"]);
+
+        let remote = merged
+            .iter()
+            .find(|s| s.def.name == "remote")
+            .unwrap()
+            .redacted();
+        assert_eq!(remote.transport, "http");
+        assert_eq!(remote.url.as_deref(), Some("https://e/mcp"));
+        assert_eq!(remote.header_names, vec!["Authorization"]);
+
+        // The single chokepoint must never serialize a secret VALUE on any
+        // surface (web JSON, CLI --json, TUI rows all go through this).
+        let json = serde_json::to_string(&merged.iter().map(|s| s.redacted()).collect::<Vec<_>>())
+            .unwrap();
+        assert!(
+            !json.contains("SUPER_SECRET_DO_NOT_LEAK"),
+            "env value leaked: {json}"
+        );
+        assert!(
+            !json.contains("HEADER_SECRET_DO_NOT_LEAK"),
+            "header value leaked: {json}"
+        );
+        assert!(json.contains("TOKEN") && json.contains("Authorization"));
+    }
+
+    /// A temp HOME for a test that goes through the real-home entry points.
+    /// `CLAUDE_CONFIG_DIR` is cleared alongside it: native discovery falls back
+    /// to it, so a developer running under a wrapper that exports it would
+    /// otherwise read their own config instead of this one.
     fn set_tmp_home() -> (tempfile::TempDir, crate::session::test_support::EnvGuard) {
         let dir = tempfile::tempdir().unwrap();
         let guard = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"])

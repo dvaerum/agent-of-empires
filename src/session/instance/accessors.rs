@@ -92,6 +92,7 @@ impl Instance {
             import_pending: None,
             fork_pending: None,
             terminal_rebind_pending: false,
+            session_mcp_servers: Vec::new(),
             acp_load_session_capable: None,
             last_error_check: None,
             last_start_time: None,
