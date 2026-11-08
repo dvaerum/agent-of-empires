@@ -724,6 +724,9 @@ impl Instance {
             .acp_session_id
             .clone()
             .context("ACP conversation ID is unavailable")?;
+        if self.tool == "opencode" {
+            return self.opencode_keep_context_state(sid);
+        }
         let asserted = self
             .resume_binding
             .as_ref()
@@ -748,6 +751,36 @@ impl Instance {
         let binding = resolved
             .context(unresolved)?
             .ok_or_else(|| anyhow::anyhow!(unresolved))?;
+        Ok(ConversationState {
+            tool: self.tool.clone(),
+            session_id: Some(sid.clone()),
+            binding: Some(binding.clone()),
+            intent: ResumeIntent::Use(sid),
+            resume_binding: Some(binding),
+            active: None,
+            pi_session_path: None,
+        })
+    }
+
+    /// `opencode acp` never reports a native store, so the `ses_` id alone is
+    /// the handoff target. Resolving it with the id as target runs the same
+    /// database, schema, workspace and cwd checks the terminal launch makes, so
+    /// a session the terminal could not resume is refused here instead of
+    /// after the handoff has retired the structured worker.
+    fn opencode_keep_context_state(&self, sid: String) -> Result<ConversationState> {
+        anyhow::ensure!(
+            !self.is_sandboxed(),
+            "a sandboxed OpenCode session cannot hand its conversation to a host terminal"
+        );
+        let execution = self
+            .resolve_native_execution(Some((&sid, None, true)))
+            .context("OpenCode cannot prove this conversation exists in its database; terminal view refused without replacing it")?;
+        let binding = ConversationBinding {
+            session_id: sid.clone(),
+            execution: Some(execution.binding),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        };
         Ok(ConversationState {
             tool: self.tool.clone(),
             session_id: Some(sid.clone()),
@@ -966,6 +999,111 @@ mod tests {
         inst.acp_session_id = Some("sid-abc".into());
 
         assert!(inst.terminal_keep_context_state(None).is_err());
+    }
+
+    /// An opencode structured session whose store holds `sid` (in `session_v2`
+    /// only, as on a 2.x build), routed through a profile-declared database.
+    /// Returns the instance, the canonical database path, and the PATH guard.
+    fn structured_opencode_fixture(
+        temp: &tempfile::TempDir,
+        profile: &str,
+        sid: &str,
+        seed: bool,
+    ) -> (
+        Instance,
+        std::path::PathBuf,
+        crate::session::test_support::EnvGuard,
+    ) {
+        let opencode = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "opencode",
+            "#!/bin/sh\ncase \"$1\" in --version) echo 2.0.24;; --help) ;; esac\n",
+        );
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let database = temp.path().join("opencode.db");
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL)",
+        )
+        .unwrap();
+        if seed {
+            db.execute(
+                "INSERT INTO session_v2 VALUES (?1, NULL, ?2)",
+                rusqlite::params![sid, project.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        let mut config = crate::session::config::profile_config::ProfileConfig::default();
+        config.overrides.insert(
+            "environment".to_string(),
+            serde_json::json!([format!("OPENCODE_DB={}", database.display())]),
+        );
+        crate::session::config::profile_config::save_profile_config(profile, &config).unwrap();
+        let mut inst = tool_instance("opencode", project.to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.view = View::Structured;
+        inst.acp_session_id = Some(sid.into());
+        (inst, database.canonicalize().unwrap(), opencode)
+    }
+
+    /// `opencode acp` never reports a native store, so the handoff cannot ask
+    /// the worker for one: the `ses_` id alone, found in opencode's database,
+    /// is the proof.
+    #[test]
+    #[serial_test::serial]
+    fn opencode_handoff_keeps_context_for_a_session_in_its_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let sid = "ses_0000000000000000000000000000abcd";
+        let (inst, database, _path) =
+            structured_opencode_fixture(&temp, "opencode-handoff-present", sid, true);
+
+        let planned = inst.terminal_keep_context_state(None).unwrap();
+
+        assert_eq!(planned.session_id.as_deref(), Some(sid));
+        assert_eq!(planned.intent, ResumeIntent::Use(sid.to_string()));
+        let execution = planned
+            .resume_binding
+            .as_ref()
+            .and_then(|binding| binding.execution.as_ref())
+            .expect("a proven opencode binding");
+        assert_eq!(execution.agent, "opencode");
+        assert_eq!(execution.stores, vec![database]);
+        assert_eq!(planned.binding, planned.resume_binding);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_handoff_refuses_a_session_absent_from_its_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let sid = "ses_0000000000000000000000000000abcd";
+        let (inst, _, _path) =
+            structured_opencode_fixture(&temp, "opencode-handoff-absent", sid, false);
+
+        let error = inst.terminal_keep_context_state(None).unwrap_err();
+
+        assert!(format!("{error:#}").contains("absent"), "{error:#}");
+    }
+
+    /// The opencode branch must not widen what a claude session accepts: a
+    /// non-claude worker store never proves a claude conversation.
+    #[test]
+    #[serial_test::serial]
+    fn claude_handoff_still_refuses_a_non_claude_worker_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let sid = "ses_0000000000000000000000000000abcd";
+        let (opencode, _, _path) =
+            structured_opencode_fixture(&temp, "claude-vs-opencode-worker", sid, true);
+        let worker = opencode.resolve_native_execution(None).unwrap().binding;
+        let mut inst = Instance::new("claude-foreign-worker", "/tmp");
+        inst.view = View::Structured;
+        inst.acp_session_id = Some(sid.into());
+
+        assert!(inst.terminal_keep_context_state(Some(&worker)).is_err());
     }
 
     /// A legacy binding carries no route marker, and the marker it would be
