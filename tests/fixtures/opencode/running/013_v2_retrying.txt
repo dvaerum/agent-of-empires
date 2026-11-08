@@ -1,0 +1,48 @@
+# FIXTURE: OpenCode - Running State
+# Captured from: 2.2.5 TUI in a throwaway tmux pane against a mock OpenAI-compatible server
+# Capture date: 2026-11-08
+# Verified against: 2.2.5 (last check: 2026-11-08)
+#
+# Expected status: Running
+# Key indicators: "Retrying in Ns" notice with the footer "esc interrupt" still shown
+
+
+ ⠋ New session                   +
+  ┃
+  ┃  run TOOLME
+  ┃
+
+  ┃
+  ┃  $ pwd
+  ┃
+  ┃  The user declined this tool call
+  ┃
+
+     Build · mock · 4.7s · interrupted
+
+  ┃
+  ┃  ask QUESTIONME
+  ┃
+
+     → Asked 1 question
+
+     Build · mock · 12.8s · interrupted
+
+  ─────────────────────────────────────────────────── ✗ Compaction ───────────────────────────────────────────────────
+
+     Compaction summary did not match the required template
+
+  ┃
+  ┃  please ERRORME
+  ┃
+
+     ⚠ Retrying in 3s · attempt 3 · mock upstream exploded
+
+     Build · mock
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · mock Mock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝■■■ esc interrupt                                                            shift+tab agents  ctrl+p commands

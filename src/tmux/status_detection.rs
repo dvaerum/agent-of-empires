@@ -628,12 +628,26 @@ enter to select · esc to cancel"],
                 "Working... esc interrupt",
                 "Generating ⠋",
                 "Loading ⠹",
+                // The armed footer after one Esc press.
+                "⬝⬝⬝⬝⬝⬝⬝⬝ esc again to interrupt",
+                // A running tool row, no dialog on screen.
+                "⠴ ls -la /\nPress ctrl+b to move running work to the background",
             ],
         );
         assert_all(
             detect_opencode_status,
             Status::Waiting,
             &[
+                // opencode 2.x labels the middle option "Always allow".
+                "△ Permission required\n  Allow once   Always allow   Reject",
+                // Two-option variant without a persistent grant.
+                "△ Permission required\n  Allow once   Reject",
+                // 1.x second step of Allow always.
+                "△ Always allow\n  Confirm   Cancel",
+                // The dialog stays Waiting while the tool row's spinner is still drawn.
+                "⠴ ls -la /\nPress ctrl+b to move running work to the background\n△ Permission required\n  Allow once   Always allow   Reject",
+                // Question tool: numbered list drawn without a selection marker.
+                "Which colour?\n1. Red\n2. Blue\n3. Type your own answer\n↑↓ select  enter submit  esc dismiss",
                 "allow this action? [y/n]",
                 "continue? (y/n)",
                 "△ Permission required\n  Allow once   Allow always   Reject",
@@ -654,6 +668,8 @@ enter to select · esc to cancel"],
                 "The approved plan remains:",
                 "the config will allow overrides",
                 "No permission required to run the tests.",
+                "Ask anything… \"What is the tech stack of this project?\"",
+                "Error: Incorrect API key provided",
             ],
         );
         assert_all(
