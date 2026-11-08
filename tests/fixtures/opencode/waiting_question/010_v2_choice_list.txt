@@ -1,0 +1,48 @@
+# FIXTURE: OpenCode - Waiting_question State
+# Captured from: 2.2.5 TUI in a throwaway tmux pane against a mock OpenAI-compatible server
+# Capture date: 2026-11-08
+# Verified against: 2.2.5 (last check: 2026-11-08)
+#
+# Expected status: Waiting
+# Key indicators: question tool list "enter submit  esc dismiss"
+
+
+ ? New session                   +
+  ┃  user
+  ┃
+
+     Done, the tool finished.
+
+     Build · mock · 4.2s
+
+  ┃
+  ┃  run TOOLME
+  ┃
+
+  ┃
+  ┃  $ pwd
+  ┃
+  ┃  The user declined this tool call
+  ┃
+
+     Build · mock · 4.7s · interrupted
+
+  ┃
+  ┃  ask QUESTIONME
+  ┃
+
+     → Asked 1 question
+
+  ┃
+  ┃  Questions
+  ┃
+  ┃  Which colour?
+  ┃
+  ┃  1. Red
+  ┃     red
+  ┃  2. Blue
+  ┃     blue
+  ┃  3. Type your own answer
+  ┃
+  ┃  ↑↓ select  enter submit  esc dismiss
+  ┃
