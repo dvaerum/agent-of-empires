@@ -480,6 +480,7 @@ impl NativeExecution {
                 | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         connection.busy_timeout(std::time::Duration::from_millis(100))?;
+        attest_opencode_store(&connection, schema)?;
         let (workspace, directory) = opencode_session_row(&connection, sid, schema)?
             .with_context(|| format!("OpenCode target {sid} is absent from this build's active session table in OPENCODE_DB"))?;
         anyhow::ensure!(
@@ -1557,7 +1558,9 @@ pub(super) enum OpenCodeSessionSchema {
 }
 
 impl OpenCodeSessionSchema {
-    // Only source-verified releases/builds qualify; CLI generation is not a schema discriminator.
+    // The 1.x range is closed and source-verified. Every 2.x names its active table
+    // `session_v2`; `attest_opencode_store` checks that against the store itself, so
+    // a new 2.x release needs no edit here.
     fn from_version_output(output: &str) -> Option<Self> {
         let version = output.trim();
         let version = version.strip_prefix("opencode v").unwrap_or(version);
@@ -1581,7 +1584,7 @@ impl OpenCodeSessionSchema {
         }
         match version {
             (1, 16, 0 | 2) | (1, 17, 0..=20) | (1, 18, 0..=35) => Some(Self::Session),
-            (2, 0, 0..=26) => Some(Self::SessionV2),
+            (2, _, _) => Some(Self::SessionV2),
             _ => None,
         }
     }
@@ -1590,6 +1593,49 @@ impl OpenCodeSessionSchema {
 #[derive(Debug, thiserror::Error)]
 #[error("OpenCode native session schema cannot be attested; explicit managed resume and fork are refused")]
 pub(super) struct UnattestedOpenCodeSchema;
+
+/// Confirms the store carries the attested table with the columns routing reads, and no
+/// newer `session_vN` that would have superseded it.
+fn attest_opencode_store(
+    connection: &rusqlite::Connection,
+    schema: OpenCodeSessionSchema,
+) -> Result<()> {
+    let table = match schema {
+        OpenCodeSessionSchema::Session => "session",
+        OpenCodeSessionSchema::SessionV2 => "session_v2",
+    };
+    let probe = || -> Result<()> {
+        let columns = connection
+            .prepare("SELECT name FROM pragma_table_info(?1)")?
+            .query_map([table], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for required in ["id", "workspace_id", "directory"] {
+            anyhow::ensure!(
+                columns.iter().any(|column| column == required),
+                "OpenCode table {table} has no {required} column"
+            );
+        }
+        if schema == OpenCodeSessionSchema::SessionV2 {
+            let newer = connection
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB 'session_v[0-9]*'")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .find(|name| {
+                    name.strip_prefix("session_v")
+                        .and_then(|generation| generation.parse::<u32>().ok())
+                        .is_some_and(|generation| generation > 2)
+                });
+            anyhow::ensure!(
+                newer.is_none(),
+                "OpenCode store carries {} beyond session_v2",
+                newer.unwrap_or_default()
+            );
+        }
+        Ok(())
+    };
+    probe().map_err(|error| error.context(UnattestedOpenCodeSchema))
+}
 
 fn opencode_session_row(
     connection: &rusqlite::Connection,
@@ -3454,13 +3500,18 @@ mod tests {
             ("opencode v2.0.0\n", Some(SessionV2)),
             ("opencode v2.0.26", Some(SessionV2)),
             ("opencode v2.0.24+31bdd8e", Some(SessionV2)),
+            ("opencode v2.2.5", Some(SessionV2)),
+            ("2.1.0", Some(SessionV2)),
+            ("2.0.27", Some(SessionV2)),
+            ("2.17.300", Some(SessionV2)),
             ("1.16.1", None),
             ("1.17.21", None),
             ("1.18.36", None),
-            ("2.0.27", None),
-            ("2.1.0", None),
+            ("3.0.0", None),
+            ("2.2.5+unknown", None),
             ("2.0.24+unknown", None),
             ("2.0.24-preview", None),
+            ("2.2.5-beta.1", None),
             ("0.0.0-v2-20261008", None),
             ("local", None),
             ("02.0.24", None),
@@ -3507,6 +3558,66 @@ mod tests {
             opencode_session_row(&store, "legacy-only", SessionV2).is_err(),
             "a missing active table must not select the surviving inactive one"
         );
+    }
+
+    #[test]
+    fn opencode_store_attestation_checks_the_active_table_and_refuses_newer_generations() {
+        use OpenCodeSessionSchema::{Session, SessionV2};
+        let columns = "(id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL)";
+        for (label, ddl, schema, attested) in [
+            (
+                "2.x fresh store",
+                format!("CREATE TABLE session_v2 {columns}"),
+                SessionV2,
+                true,
+            ),
+            (
+                "2.x store migrated from 1.x keeps the frozen table",
+                format!("CREATE TABLE session {columns}; CREATE TABLE session_v2 {columns}"),
+                SessionV2,
+                true,
+            ),
+            (
+                "1.x store",
+                format!("CREATE TABLE session {columns}"),
+                Session,
+                true,
+            ),
+            (
+                "2.x build on a 1.x-only store",
+                format!("CREATE TABLE session {columns}"),
+                SessionV2,
+                false,
+            ),
+            (
+                "a table without the routing columns",
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL)".into(),
+                SessionV2,
+                false,
+            ),
+            (
+                "a newer generation supersedes session_v2",
+                format!("CREATE TABLE session_v2 {columns}; CREATE TABLE session_v3 {columns}"),
+                SessionV2,
+                false,
+            ),
+            (
+                "a non-numeric suffix is not a generation",
+                format!(
+                    "CREATE TABLE session_v2 {columns}; CREATE TABLE session_v2_backup {columns}"
+                ),
+                SessionV2,
+                true,
+            ),
+        ] {
+            let store = rusqlite::Connection::open_in_memory().unwrap();
+            store.execute_batch(&ddl).unwrap();
+            let result = attest_opencode_store(&store, schema);
+            assert_eq!(result.is_ok(), attested, "{label}: {result:?}");
+            if let Err(error) = result {
+                assert!(error.is::<UnattestedOpenCodeSchema>(), "{label}: {error:#}");
+            }
+        }
     }
 
     #[test]

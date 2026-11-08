@@ -2264,7 +2264,7 @@ mod tests {
         let version_file = home.path().join("native-version");
         let help_file = home.path().join("native-help");
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in --version) /bin/cat '{}';; --help) /bin/cat '{}';; esac\n",
+            "#!/bin/sh\ncase \"$1\" in --version) cat '{}';; --help) cat '{}';; esac\n",
             version_file.display(),
             help_file.display()
         );
@@ -2293,7 +2293,12 @@ mod tests {
                 false,
                 &["fresh", "use", "fork", "default", "fallback"][..],
             ),
-            ("2.0.27", true, &["use", "fork"][..]),
+            (
+                "2.2.5",
+                false,
+                &["fresh", "use", "fork", "default", "fallback"][..],
+            ),
+            ("3.0.0", true, &["use", "fork"][..]),
             ("distro-build", true, &["use", "fork"][..]),
         ] {
             std::fs::write(
