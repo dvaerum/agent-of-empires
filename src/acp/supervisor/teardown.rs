@@ -3402,6 +3402,68 @@ mod tests {
         assert!(!sup.is_owned("s-escalate").await);
     }
 
+    /// An adapter that advertises `session/delete` (OpenCode 2.x does) really erases the
+    /// transcript, so every keep-context stop, including the captured stop a terminal
+    /// handoff uses, must leave it alone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn keep_context_stops_never_send_session_delete() {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        let (_home, tmp) = isolate_home();
+        let (dead_pid, dead_birth) = {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "read -r release"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn helper");
+            let id = child.id();
+            let birth = crate::process::process_birth_identity(id)
+                .unwrap()
+                .expect("blocked helper has a live process birth identity");
+            child
+                .stdin
+                .take()
+                .expect("piped helper input")
+                .write_all(b"release\n")
+                .unwrap();
+            assert!(child.wait().expect("wait for helper").success());
+            (id, birth)
+        };
+        let sup = Supervisor::new(VecSink::new());
+        let deadline = Duration::from_secs(5);
+        for stop in ["shutdown", "shutdown_idle", "captured"] {
+            let session: &'static str = stop;
+            let mut record = worker_record(session, dead_pid, tmp.path().join(session));
+            record.runner_identity = Some(dead_birth.clone());
+            record.stored_acp_session_id = Some("acp-test-id".into());
+            worker_registry::save(&record).unwrap();
+            let (client, _tx, saw_delete) =
+                AcpClient::fake_for_test_recording(crate::acp::state::AcpSessionId(session.into()));
+            sup.test_install_handle(
+                session,
+                client,
+                WorkerKind::Stdio,
+                Some(RunnerIdentity::from_record(&record)),
+            )
+            .await;
+            match stop {
+                "shutdown" => sup.shutdown(session).await.unwrap(),
+                "shutdown_idle" => sup.shutdown_idle(session, None).await.unwrap(),
+                _ => {
+                    let target = sup.capture_retirement(session).unwrap();
+                    sup.shutdown_captured_and_wait(session, &target, deadline)
+                        .await
+                        .unwrap()
+                }
+            }
+            assert!(
+                !saw_delete.load(Ordering::SeqCst),
+                "{stop} sent session/delete"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_and_wait_outlasts_a_cancelled_resume() {
