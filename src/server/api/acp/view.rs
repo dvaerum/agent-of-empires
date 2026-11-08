@@ -3721,6 +3721,33 @@ mod tests {
         }
     }
 
+    /// A preassigned id on OpenCode 2.x lives only in `session_v2` (the legacy table
+    /// stops growing once it has migrated), and the terminal-to-structured switch must
+    /// still carry it into the seeded `session/load`.
+    #[test]
+    fn opencode_switch_carries_an_id_that_only_session_v2_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL);
+                 CREATE TABLE session_v2 (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL);
+                 INSERT INTO session_v2 VALUES ('ses_preassigned', NULL, '/p');",
+            )
+            .unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("OPENCODE_DB", &db_path)]);
+        for (sid, expected) in [
+            ("ses_preassigned", Some("ses_preassigned")),
+            ("ses_gone", None),
+        ] {
+            let present = host_transcript_present("opencode", "/p", sid, &[], None);
+            let seed =
+                resolve_structured_seed("opencode", "opencode", None, Some(sid), false, present);
+            assert_eq!(seed.stored_acp_session_id.as_deref(), expected, "{sid}");
+        }
+    }
+
     #[test]
     fn persisted_disable_adoption_keeps_nondefault_launch_profile() {
         let mut cached = Instance::new("t", "/tmp");
