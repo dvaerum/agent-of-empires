@@ -220,6 +220,7 @@ fn public_creation_failure(body: &str, local_owner: bool) -> String {
             | "create_outcome_unknown"
             | "creation_cancelled"
             | "creation_trust_changed"
+            | "fork_unsupported"
     );
     if !public && !local_owner {
         return "Session creation refused; inspect the Daemon log".to_owned();
@@ -1464,6 +1465,13 @@ mod tests {
         assert!(rendered.contains("exited with code 7"));
         assert!(rendered.contains("running_hooks"));
         assert!(rendered.contains("creation-ref"));
+    }
+
+    #[test]
+    fn creation_failure_shows_the_fork_refusal_reason_remotely() {
+        let refusal = r#"{"error":"fork_unsupported","message":"Nothing to fork: session 'parent' has no single captured conversation to fork from."}"#;
+        let rendered = public_creation_failure(refusal, false);
+        assert!(rendered.contains("Nothing to fork: session 'parent'"));
     }
 
     #[tokio::test]

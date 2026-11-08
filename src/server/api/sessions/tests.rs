@@ -11779,6 +11779,35 @@ async fn creation_boundary_cli_fork_reads_the_pinned_binding_across_agent_accoun
 
 #[tokio::test]
 #[serial_test::serial]
+async fn cli_fork_of_a_never_started_session_names_the_parent_in_the_refusal() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut source = Instance::new("never started", project.path().to_str().unwrap());
+    source.source_profile = "test".into();
+    source.tool = "claude".into();
+    source.status = Status::Stopped;
+    assert!(source.agent_session_id.is_none());
+    crate::server::test_support::seed_instances_on_disk_for_test("test", vec![source.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+    let (status, body) = post_create(
+        &state,
+        serde_json::json!({
+            "path": project.path(), "profile": "test", "tool": "claude", "cli": {},
+            "fork_session_id": source.id,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "fork_unsupported", "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("never started"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn cli_cancellation_at_final_commit_removes_provisioned_scratch() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();

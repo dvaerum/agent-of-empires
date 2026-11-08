@@ -224,7 +224,7 @@ pub(super) async fn resolve_canonical_fork_seed(
             crate::session::capture::generate_session_uuid(),
             source.is_sandboxed(),
         )
-        .map_err(|_| StatusCode::BAD_REQUEST.into_response());
+        .map_err(|denied| fork_refusal(&denied, &source));
     }
     let instances = state.instances.read().await;
     let source = instances
@@ -264,7 +264,26 @@ pub(super) async fn resolve_canonical_fork_seed(
         source.is_structured(),
         std::slice::from_ref(source),
     )
-    .map_err(|_| StatusCode::BAD_REQUEST.into_response())
+    .map_err(|(denied, _)| fork_refusal(&denied, source))
+}
+
+/// A refused fork source answers with the reason. A bare 400 reaches the CLI as
+/// the generic "inspect the Daemon log", and these early exits log nothing.
+fn fork_refusal(
+    denied: &crate::session::ForkDenied,
+    source: &crate::session::Instance,
+) -> axum::response::Response {
+    tracing::warn!(
+        target: "http.api.sessions",
+        session = %source.id,
+        reason = ?denied,
+        "fork source refused at session creation"
+    );
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "fork_unsupported",
+        denied.user_message(&source.title, &source.id, &source.effective_profile()),
+    )
 }
 
 /// The ACP registry key a create request resolves to: an explicit `agent_name`
