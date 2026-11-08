@@ -132,10 +132,16 @@ impl ServeClient {
             .await
             .with_context(|| format!("opencode fork of {parent_id} failed"))?;
         let status = resp.status();
-        anyhow::ensure!(
-            status.is_success(),
-            "opencode fork of {parent_id} returned {status}"
-        );
+        if !status.is_success() {
+            // 2.x explains a refusal (an empty parent, say) only in the body; the
+            // status is reported either way, so an unreadable body costs only the reason.
+            let body = resp.text().await.unwrap_or_default();
+            let reason = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|json| json.get("message")?.as_str().map(str::to_owned))
+                .unwrap_or_else(|| body.chars().take(200).collect());
+            anyhow::bail!("opencode fork of {parent_id} returned {status}: {reason}");
+        }
         let body: serde_json::Value = resp
             .json()
             .await
@@ -491,6 +497,27 @@ mod tests {
         );
         assert!(result.is_err(), "a fork without a child id is refused");
         let _ = handle.join();
+    }
+
+    /// 2.x answers a fork of a session with no messages with a 400 whose body is the
+    /// only place the reason lives.
+    #[test]
+    fn a_refused_fork_reports_the_servers_reason() {
+        let (handle, port) = serve_once(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 103\r\n\r\n{\"_tag\":\"InvalidRequestError\",\"message\":\"Cannot fork empty session: ses_parent\",\"kind\":\"empty_session\"}",
+        );
+        let error = block_on(
+            |client| {
+                let parent = "ses_parent".to_string();
+                Box::pin(async move { client.fork_session(&parent).await })
+            },
+            port,
+        )
+        .unwrap_err();
+        let _ = handle.join();
+        let message = format!("{error:#}");
+        assert!(message.contains("400"), "{message}");
+        assert!(message.contains("Cannot fork empty session"), "{message}");
     }
 
     #[cfg(unix)]
