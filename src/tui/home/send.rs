@@ -17,6 +17,38 @@ pub(super) fn permission_response_tokens(
     }
 }
 
+/// The extra keys an Allow-always still needs, judged from the pane after the first sequence.
+pub(super) fn allow_always_followup_tokens(
+    response: &crate::agents::PermissionResponse,
+    pane: &str,
+) -> Option<&'static [crate::agents::KeyToken<'static>]> {
+    let followup = response.allow_always_followup?;
+    pane.contains(followup.when_pane_contains)
+        .then_some(followup.tokens)
+}
+
+/// Poll for the confirmation step a dialog may draw after the opening keys,
+/// stopping as soon as the dialog is gone (nothing more to send).
+fn send_allow_always_followup(
+    session: &crate::tmux::Session,
+    response: &crate::agents::PermissionResponse,
+) -> anyhow::Result<()> {
+    if response.allow_always_followup.is_none() {
+        return Ok(());
+    }
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let pane = session.capture_plain(40)?;
+        if let Some(tokens) = allow_always_followup_tokens(response, &pane) {
+            return session.send_key_tokens(tokens);
+        }
+        if !pane.contains('\u{25B3}') {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 impl HomeView {
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {
         self.mutate_instance(id, |inst| inst.status = status);
@@ -179,7 +211,14 @@ impl HomeView {
                 return;
             }
         };
-        if let Err(e) = tmux_session.send_key_tokens(tokens) {
+        let sent = tmux_session.send_key_tokens(tokens).and_then(|()| {
+            if choice == crate::tui::dialogs::PermissionResponseChoice::AllowAlways {
+                send_allow_always_followup(&tmux_session, &response)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = sent {
             self.info_dialog = Some(InfoDialog::new(
                 "Respond Failed",
                 &format!("Failed to send response: {}", e),
@@ -199,6 +238,7 @@ mod permission_response_tokens_tests {
         let response = PermissionResponse {
             allow: &[KeyToken::Literal("1")],
             allow_always: Some(&[KeyToken::Literal("2")]),
+            allow_always_followup: None,
             deny: &[KeyToken::Literal("3")],
         };
         assert_eq!(
@@ -219,6 +259,72 @@ mod permission_response_tokens_tests {
         };
         assert_eq!(
             permission_response_tokens(&without_always, PermissionResponseChoice::AllowAlways),
+            None
+        );
+    }
+
+    fn opencode_response() -> PermissionResponse {
+        crate::agents::get_agent("opencode")
+            .and_then(|a| a.permission_response)
+            .expect("opencode declares permission keys")
+    }
+
+    const OPENCODE_1X_ALWAYS_CONFIRM: &str = include_str!(
+        "../../../tests/fixtures/opencode/waiting_permission/021_v1_always_confirm.txt"
+    );
+    const OPENCODE_2X_ALWAYS_PREVIEW: &str = include_str!(
+        "../../../tests/fixtures/opencode/waiting_permission/011_v2_always_allow_selected.txt"
+    );
+    const OPENCODE_2X_TOOL_DONE: &str =
+        include_str!("../../../tests/fixtures/opencode/idle/012_v2_tool_done.txt");
+
+    /// 2.x applies Always allow on the first Enter, 1.x asks to confirm. The
+    /// opening keys must be the 2.x ones (an extra Enter there would approve
+    /// the next dialog unseen); the 1.x confirmation is added only when the
+    /// pane draws it.
+    #[test]
+    fn opencode_allow_always_confirms_only_when_the_pane_asks() {
+        let response = opencode_response();
+        assert_eq!(
+            response.allow_always,
+            Some(&[KeyToken::Named("Right"), KeyToken::Named("Enter")][..])
+        );
+        assert_eq!(
+            allow_always_followup_tokens(&response, OPENCODE_1X_ALWAYS_CONFIRM),
+            Some(&[KeyToken::Named("Enter")][..])
+        );
+        assert_eq!(
+            allow_always_followup_tokens(&response, OPENCODE_2X_TOOL_DONE),
+            None
+        );
+        // Still on the first dialog: the opening keys have not landed yet.
+        assert_eq!(
+            allow_always_followup_tokens(&response, OPENCODE_2X_ALWAYS_PREVIEW),
+            None
+        );
+    }
+
+    /// The selection starts on Allow once and wraps, so Left lands on Reject in
+    /// every dialog shape (two or three options, 1.x or 2.x). Counting Right
+    /// presses would land on Allow once in the two-option dialog.
+    #[test]
+    fn opencode_deny_reaches_reject_by_wrapping_left_from_the_first_option() {
+        assert_eq!(
+            opencode_response().deny,
+            &[KeyToken::Named("Left"), KeyToken::Named("Enter")][..]
+        );
+    }
+
+    #[test]
+    fn followup_is_absent_for_agents_that_declare_none() {
+        let response = PermissionResponse {
+            allow: &[],
+            allow_always: None,
+            allow_always_followup: None,
+            deny: &[],
+        };
+        assert_eq!(
+            allow_always_followup_tokens(&response, OPENCODE_1X_ALWAYS_CONFIRM),
             None
         );
     }
