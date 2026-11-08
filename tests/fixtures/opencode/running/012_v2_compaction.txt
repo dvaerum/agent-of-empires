@@ -1,0 +1,48 @@
+# FIXTURE: OpenCode - Running State
+# Captured from: 2.2.5 TUI in a throwaway tmux pane against a mock OpenAI-compatible server
+# Capture date: 2026-11-08
+# Verified against: 2.2.5 (last check: 2026-11-08)
+#
+# Expected status: Running
+# Key indicators: "Compaction" divider, streaming summary, footer "esc interrupt"; earlier API error still in scrollback
+
+
+   New session                     New session                   ⠦ New session                   +
+  ┃
+  ┃  user
+  ┃
+
+     Done, the tool finished.
+
+     Build · mock · 16.8s
+
+  ┃
+  ┃  ask QUESTIONME
+  ┃
+
+     → Asked 1 question
+
+     Build · mock · 14.0s · interrupted
+
+  ┃
+  ┃  please ERRORME
+  ┃
+
+  ┃
+  ┃  now ERRFATAL
+  ┃
+
+     Error: Incorrect API key provided
+
+     Build · mock · 49ms
+
+  ─────────────────────────────────────────────────── ⠼ Compaction ───────────────────────────────────────────────────
+
+     lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · mock Mock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                                            shift+tab agents  ctrl+p commands

@@ -1,0 +1,48 @@
+# FIXTURE: OpenCode - Idle State
+# Captured from: 2.2.5 TUI in a throwaway tmux pane against a mock OpenAI-compatible server
+# Capture date: 2026-11-08
+# Verified against: 2.2.5 (last check: 2026-11-08)
+#
+# Expected status: Idle
+# Key indicators: turn shown as "interrupted", no interrupt footer
+
+
+   New session                   +
+
+  ┃
+  ┃  hello SLOWME
+  ┃
+
+     lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem
+     ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum
+     dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem
+
+     Build · mock · 8.4s · interrupted
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · mock Mock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  /…/fixture/work  shift+tab agents  ctrl+p commands

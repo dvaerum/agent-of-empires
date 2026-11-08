@@ -4,7 +4,8 @@ id = "opencode"
 extends = "interrupt_hint"
 id = "interrupt_hint"
 priority = 970
-contains_any = ["esc to interrupt", "esc interrupt"]
+# "esc again to interrupt" is the footer after one Esc press, in 1.x and 2.x.
+contains_any = ["esc to interrupt", "esc interrupt", "esc again to interrupt"]
 
 [[rules]]
 extends = "spinner"
@@ -21,14 +22,30 @@ region = "whole_recent"
 visible = true
 contains_any = ["(y/n)", "[y/n]", "continue?", "proceed?", "enter to select", "esc to cancel"]
 
-# The permission dialog's option row, which prose does not reproduce.
+# The permission dialog's option row, which prose does not reproduce: 1.x
+# labels the middle option "Allow always", 2.x "Always allow", and some
+# dialogs offer no grant at all. Ranks above the spinner and interrupt rules
+# because the dialog is drawn while the tool row's spinner still turns.
 [[rules]]
 id = "permission_dialog"
 state = "waiting"
-priority = 955
+priority = 980
 region = "whole_recent"
 visible = true
-line_regex = ['(?i)allow once\s+allow always']
+any = [
+  { line_regex = ['(?i)allow once\s+(?:allow always|always allow|reject)'] },
+  { line_regex = ['\x{25B3}\s*(?:Permission required|Always allow)'] },
+]
+
+# The question tool's list: numbered rows with no selection marker, so only
+# its key hints identify it.
+[[rules]]
+id = "question_dialog"
+state = "waiting"
+priority = 980
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)enter submit\s+esc dismiss']
 
 # A numbered menu row carrying the selection cursor.
 [[rules]]
