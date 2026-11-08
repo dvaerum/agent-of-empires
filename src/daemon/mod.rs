@@ -221,6 +221,7 @@ fn public_creation_failure(body: &str, local_owner: bool) -> String {
             | "creation_cancelled"
             | "creation_trust_changed"
             | "fork_unsupported"
+            | "fork_invalid"
     );
     if !public && !local_owner {
         return "Session creation refused; inspect the Daemon log".to_owned();
@@ -1465,6 +1466,13 @@ mod tests {
         assert!(rendered.contains("exited with code 7"));
         assert!(rendered.contains("running_hooks"));
         assert!(rendered.contains("creation-ref"));
+    }
+
+    #[test]
+    fn creation_failure_shows_the_invalid_fork_reason_remotely() {
+        let refusal = r#"{"error":"fork_invalid","message":"Cannot fork session 'parent': the new session must use the same tool, view and agent as the source."}"#;
+        let rendered = public_creation_failure(refusal, false);
+        assert!(rendered.contains("Cannot fork session 'parent'"));
     }
 
     #[test]

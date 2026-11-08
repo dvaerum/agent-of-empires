@@ -217,7 +217,15 @@ pub(super) async fn resolve_canonical_fork_seed(
             return Err(StatusCode::CONFLICT.into_response());
         }
         if body.view != crate::session::View::Terminal {
-            return Err(StatusCode::BAD_REQUEST.into_response());
+            return Err(fork_rejected(
+                "fork_invalid",
+                &source,
+                "cli_view_not_terminal",
+                format!(
+                    "Cannot fork session '{}' ({}): the CLI forks only terminal sessions, but this request asks for another view.",
+                    source.title, source.id
+                ),
+            ));
         }
         return crate::session::fork::terminal_fork_seed(
             source.fork_parent_ref().ok().flatten(),
@@ -244,21 +252,47 @@ pub(super) async fn resolve_canonical_fork_seed(
             && acp_agent_key(&source.tool, source.agent_name.as_deref())
                 != acp_agent_key(&body.tool, body.agent_name.as_deref()))
     {
-        return Err(StatusCode::BAD_REQUEST.into_response());
+        return Err(fork_rejected(
+            "fork_invalid",
+            source,
+            "source_mismatch",
+            format!(
+                "Cannot fork session '{}' ({}): the new session must use the same tool, view and agent as the source.",
+                source.title, source.id
+            ),
+        ));
     }
     let parent_id = if source.is_structured() {
         if !crate::session::fork::structured_fork_capable(
             &source.tool,
             source.agent_name.as_deref(),
         ) {
-            return Err(StatusCode::BAD_REQUEST.into_response());
+            return Err(fork_rejected(
+                "fork_unsupported",
+                source,
+                "structured_agent_cannot_fork",
+                format!(
+                    "Nothing to fork: session '{}' ({}) is a structured session whose agent has no native fork capability.",
+                    source.title, source.id
+                ),
+            ));
         }
         source.acp_session_id.as_deref()
     } else {
         source.agent_session_id.as_deref()
     }
-    .filter(|id| crate::session::capture::is_valid_session_id(id))
-    .ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?;
+    .ok_or_else(|| fork_refusal(&crate::session::ForkDenied::NoParentSession, source))?;
+    if !crate::session::capture::is_valid_session_id(parent_id) {
+        return Err(fork_rejected(
+            "fork_invalid",
+            source,
+            "unusable_conversation_id",
+            format!(
+                "Cannot fork session '{}' ({}): it records a conversation id in an unusable format.",
+                source.title, source.id
+            ),
+        ));
+    }
     resolve_create_fork_seed(
         parent_id,
         source.is_structured(),
@@ -267,23 +301,36 @@ pub(super) async fn resolve_canonical_fork_seed(
     .map_err(|(denied, _)| fork_refusal(&denied, source))
 }
 
-/// A refused fork source answers with the reason. A bare 400 reaches the CLI as
-/// the generic "inspect the Daemon log", and these early exits log nothing.
+/// A refused fork answers with the reason. A bare 400 reaches the CLI as the
+/// generic "inspect the Daemon log", and these early exits log nothing.
 fn fork_refusal(
     denied: &crate::session::ForkDenied,
     source: &crate::session::Instance,
 ) -> axum::response::Response {
+    fork_rejected(
+        "fork_unsupported",
+        source,
+        &format!("{denied:?}"),
+        denied.user_message(&source.title, &source.id, &source.effective_profile()),
+    )
+}
+
+/// The one exit for a fork request refused at creation: logs the reason, then
+/// answers 400 with `code` and a message that names only the source's title
+/// and id.
+fn fork_rejected(
+    code: &'static str,
+    source: &crate::session::Instance,
+    reason: &str,
+    message: String,
+) -> axum::response::Response {
     tracing::warn!(
         target: "http.api.sessions",
         session = %source.id,
-        reason = ?denied,
-        "fork source refused at session creation"
+        reason,
+        "fork refused at session creation"
     );
-    api_error(
-        StatusCode::BAD_REQUEST,
-        "fork_unsupported",
-        denied.user_message(&source.title, &source.id, &source.effective_profile()),
-    )
+    api_error(StatusCode::BAD_REQUEST, code, message)
 }
 
 /// The ACP registry key a create request resolves to: an explicit `agent_name`

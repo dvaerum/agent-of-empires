@@ -11806,6 +11806,160 @@ async fn cli_fork_of_a_never_started_session_names_the_parent_in_the_refusal() {
     );
 }
 
+/// A fork refusal at creation answers 400 with a JSON `error` code and a
+/// message naming the source, never an empty body.
+async fn fork_refusal_for(
+    source: Instance,
+    request: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::server::test_support::seed_instances_on_disk_for_test("test", vec![source.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+    let mut request = request;
+    request["profile"] = "test".into();
+    request["fork_session_id"] = source.id.clone().into();
+    let (status, bytes) = post_create_bytes(&state, request).await;
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| panic!("refusal must carry a JSON body, got {} bytes", bytes.len()));
+    (status, body)
+}
+
+fn fork_refusal_source(title: &str, project: &std::path::Path) -> Instance {
+    let mut source = Instance::new(title, project.to_str().unwrap());
+    source.source_profile = "test".into();
+    source.tool = "claude".into();
+    source.status = Status::Stopped;
+    source
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn non_cli_fork_of_a_never_started_session_names_the_parent_in_the_refusal() {
+    let project = tempfile::tempdir().unwrap();
+    let source = fork_refusal_source("never started api", project.path());
+    let (status, body) = fork_refusal_for(
+        source,
+        serde_json::json!({ "path": project.path(), "tool": "claude" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "fork_unsupported", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("never started api"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn fork_of_a_session_with_an_unusable_conversation_id_is_refused_with_a_reason() {
+    let project = tempfile::tempdir().unwrap();
+    let mut source = fork_refusal_source("bad id parent", project.path());
+    source.agent_session_id = Some("not a valid id!".into());
+    let (status, body) = fork_refusal_for(
+        source,
+        serde_json::json!({ "path": project.path(), "tool": "claude" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "fork_invalid", "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("bad id parent"), "{body}");
+    assert!(!message.contains("not a valid id!"), "{body}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn fork_into_a_different_tool_is_refused_with_a_reason() {
+    let project = tempfile::tempdir().unwrap();
+    let mut source = fork_refusal_source("tool mismatch parent", project.path());
+    source.agent_session_id = Some("parent-uuid".into());
+    let (status, body) = fork_refusal_for(
+        source,
+        serde_json::json!({ "path": project.path(), "tool": "codex" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "fork_invalid", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("tool mismatch parent"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn fork_of_a_structured_session_whose_agent_cannot_fork_is_refused_with_a_reason() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut source = fork_refusal_source("structured parent", project.path());
+    source.tool = "no-such-acp-agent".into();
+    source.view = crate::session::View::Structured;
+    source.acp_session_id = Some("acp-parent".into());
+    crate::server::test_support::seed_instances_on_disk_for_test("test", vec![source.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    let body = create_body_from_json(serde_json::json!({
+        "path": project.path(), "profile": "test", "tool": "no-such-acp-agent",
+        "view": "structured",
+    }));
+    let response = create::resolve_canonical_fork_seed(&state, &body, &source.id)
+        .await
+        .unwrap_err();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| panic!("refusal must carry a JSON body, got {} bytes", bytes.len()));
+    assert_eq!(body["error"], "fork_unsupported", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("structured parent"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_fork_into_a_structured_view_is_refused_with_a_reason() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let source = fork_refusal_source("view mismatch parent", project.path());
+    crate::server::test_support::seed_instances_on_disk_for_test("test", vec![source.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+    let body = create_body_from_json(serde_json::json!({
+        "path": project.path(), "profile": "test", "tool": "claude", "cli": {},
+        "view": "structured",
+    }));
+    let response = create::resolve_canonical_fork_seed(&state, &body, &source.id)
+        .await
+        .unwrap_err();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| panic!("refusal must carry a JSON body, got {} bytes", bytes.len()));
+    assert_eq!(body["error"], "fork_invalid", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("view mismatch parent"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn cli_cancellation_at_final_commit_removes_provisioned_scratch() {
