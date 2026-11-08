@@ -103,6 +103,29 @@ fn resolve_structured_seed(
             };
         }
     }
+    // A previously-structured session whose live `acp_session_id` was lost (e.g. a
+    // resume cancelled mid-flight by a daemon/worker restart) still has its ACP
+    // session id persisted in `agent_session_id`. When the structured agent owns
+    // the tool's native adapter (`tool == acp_agent`) and can resume (its
+    // `session_support` is `Some`, i.e. it declares a concrete `ResumeStrategy`),
+    // `session/load` that id instead of cold-starting a brand-new empty
+    // conversation. The agent's own `session/load` returns history, so no seeded
+    // replay; a stale id fails the load and the spawn falls back to fresh, so this
+    // is safe. Without this, non-claude agents (e.g. opencode) silently lose their
+    // conversation on a churned resume; claude stays on the transcript path above
+    // via `acp_transcript_cli_resumable`.
+    if tool == acp_agent
+        && !crate::agents::acp_transcript_cli_resumable(tool, acp_agent)
+        && crate::agents::get_agent(tool).is_some_and(|a| a.session_support.is_some())
+    {
+        if let Some(id) = agent_session_id.filter(|s| !s.trim().is_empty()) {
+            return StructuredSeed {
+                stored_acp_session_id: Some(id.to_string()),
+                seed_history_replay: import_pending,
+                import_terminal: false,
+            };
+        }
+    }
     StructuredSeed {
         stored_acp_session_id: None,
         seed_history_replay: import_pending,
@@ -3698,9 +3721,26 @@ mod tests {
                 None,
                 false,
             ),
+            // Native non-claude adapter with a persisted ACP id + a resumable
+            // strategy: session/load it instead of cold-starting an empty
+            // session (regression guard for the churned-resume context loss).
+            // No seeded replay; the agent's own session/load returns history.
+            // Does not apply to opencode: opencode's own CLI-resumable path
+            // above already handles it with richer (replay-seeded) behavior.
             (
                 "codex",
                 "codex",
+                None,
+                Some("agent-1"),
+                false,
+                true,
+                Some("agent-1"),
+                false,
+            ),
+            // Unknown tool (no agent def, session_support indeterminate): stay fresh.
+            (
+                "nope",
+                "nope",
                 None,
                 Some("agent-1"),
                 false,
