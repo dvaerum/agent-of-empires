@@ -62,8 +62,17 @@ impl Instance {
             self.last_error = src.last_error.clone();
             self.last_error_check = src.last_error_check;
         }
+        // A same-generation Starting snapshot predates a status the daemon already published.
+        let launch_already_progressed = src.lifecycle_generation == self.lifecycle_generation
+            && src.status == Status::Starting
+            && matches!(
+                self.status,
+                Status::Idle | Status::Running | Status::Waiting
+            );
         self.lifecycle_generation = src.lifecycle_generation;
-        self.status = src.status;
+        if !launch_already_progressed {
+            self.status = src.status;
+        }
         // A launch decided before a peer archived the row reports a pane
         // the archive tore down.
         if self.is_archived() {
@@ -826,6 +835,28 @@ mod tests {
     }
 
     #[test]
+    fn same_generation_launch_snapshot_does_not_downgrade_a_progressed_status() {
+        for progressed in [Status::Idle, Status::Running, Status::Waiting] {
+            let mut stored = inst();
+            stored.lifecycle_generation = 5;
+            stored.status = progressed;
+            let mut working = stored.clone();
+            working.status = Status::Starting;
+            stored.merge_post_restart(&working);
+            assert_eq!(stored.status, progressed, "{progressed:?}");
+        }
+        // A newer generation still imports the launch's Starting.
+        let mut stored = inst();
+        stored.lifecycle_generation = 5;
+        stored.status = Status::Idle;
+        let mut working = stored.clone();
+        working.lifecycle_generation = 6;
+        working.status = Status::Starting;
+        stored.merge_post_restart(&working);
+        assert_eq!(stored.status, Status::Starting);
+    }
+
+    #[test]
     fn runtime_reload_keeps_newer_disk_lifecycle_and_runtime_only_state() {
         let floor = |secs| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
         let mut previous = inst();
@@ -897,6 +928,8 @@ mod tests {
     #[test]
     fn merge_post_restart_keeps_peer_sid_and_matching_marker() {
         let mut stored = inst();
+        // The launch's reservation stored Starting before the snapshot is merged.
+        stored.status = Status::Starting;
         stored.agent_session_id = Some("peer-fresh-sid".to_string());
         stored.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
         stored.snooze(15);

@@ -23,6 +23,12 @@ fn skip_capture(
         && observation_key == last_observation_key
 }
 
+/// A Starting row may have been written over a verdict this poller already
+/// published, so only a capture can re-decide it.
+fn status_is_a_reusable_verdict(status: Status) -> bool {
+    status != Status::Starting
+}
+
 /// How long a `running` hook write keeps its authority for an agent that is still on a hand-written
 /// detector.
 const LEGACY_RUNNING_HOOK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(900);
@@ -491,15 +497,16 @@ impl Instance {
             !policy.observe_ownership || self.live_pane_owned(session, metadata, is_dead);
         let observation = tmux::Observation::new(osc_title, hook, live_owned);
         let observation_key = plan.observation_key(&observation);
-        let screen_unchanged = skip_capture(
-            activity,
-            self.detection.activity,
-            self.detection.captured_at,
-            hook.is_some(),
-            self.detection.pending.is_some(),
-            observation_key,
-            self.detection.observation_key,
-        );
+        let screen_unchanged = status_is_a_reusable_verdict(self.status)
+            && skip_capture(
+                activity,
+                self.detection.activity,
+                self.detection.captured_at,
+                hook.is_some(),
+                self.detection.pending.is_some(),
+                observation_key,
+                self.detection.observation_key,
+            );
 
         if screen_unchanged {
             // Nothing to re-decide, and nothing to re-derive from: the checks
@@ -621,6 +628,18 @@ mod tests {
                 skip,
                 "{args:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_starting_status_is_never_the_last_known_verdict() {
+        for (status, reusable) in [
+            (Status::Idle, true),
+            (Status::Running, true),
+            (Status::Waiting, true),
+            (Status::Starting, false),
+        ] {
+            assert_eq!(status_is_a_reusable_verdict(status), reusable, "{status:?}");
         }
     }
 
