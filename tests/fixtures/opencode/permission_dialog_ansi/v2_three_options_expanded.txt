@@ -1,0 +1,40 @@
+   done                          ! done                          +
+  ┃
+  ┃  △ Permission required
+  ┃
+  ┃  $ echo hello-from-mock
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃   Allow once   Always allow   Reject                                   ctrl+f minimize  ⇆ select  enter confirm
+  ┃
+
