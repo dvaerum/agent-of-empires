@@ -152,16 +152,20 @@ pub(super) fn keys_to_reach(from: usize, count: usize, target: usize) -> Vec<Sel
 }
 
 /// What Escape leaves behind that Deny still has to dismiss, judged from the plain pane.
+///
+/// Escape on an expanded dialog only collapses it, so a dialog still on screen
+/// (either `ctrl+f` hint, or its option row) means another Escape is due.
 pub(super) fn deny_followup_tokens(
     pane: &str,
 ) -> Option<&'static [crate::agents::KeyToken<'static>]> {
     use crate::agents::KeyToken::Named;
-    if pane.contains("ctrl+f minimize") {
-        Some(&[Named("Escape")])
-    } else if pane.contains("Reject permission")
-        || pane.contains("Tell OpenCode what to do differently")
-    {
+    if pane.contains("Reject permission") || pane.contains("Tell OpenCode what to do differently") {
         Some(&[Named("Enter")])
+    } else if pane.contains("ctrl+f minimize")
+        || pane.contains("ctrl+f fullscreen")
+        || (pane.contains("Allow once") && pane.contains("Reject"))
+    {
+        Some(&[Named("Escape")])
     } else {
         None
     }
@@ -276,7 +280,7 @@ fn move_highlight_to(
     }
 }
 
-/// After Escape: collapse an expanded dialog, or confirm a subagent's Reject
+/// After Escape: collapse an expanded dialog (and dismiss it), or confirm a subagent's Reject
 /// prompt. Bounded so a dialog that never settles cannot trap the caller.
 fn dismiss_leftover_deny_stages(pane: &impl DialogPane) -> anyhow::Result<()> {
     for _ in 0..3 {
@@ -632,9 +636,46 @@ mod permission_response_tokens_tests {
             deny_followup_tokens("Tell OpenCode what to do differently"),
             Some(&[KeyToken::Named("Enter")][..])
         );
-        assert_eq!(deny_followup_tokens(PLAIN_DIALOG), None);
         assert_eq!(deny_followup_tokens(OPENCODE_2X_TOOL_DONE), None);
         assert_eq!(deny_followup_tokens(""), None);
+    }
+
+    /// Escape on an expanded dialog only collapses it: the `fullscreen` view
+    /// still holds the pending dialog, so it needs another Escape.
+    #[test]
+    fn deny_escapes_again_while_the_collapsed_dialog_is_still_pending() {
+        assert!(PLAIN_DIALOG.contains("ctrl+f fullscreen"));
+        assert_eq!(
+            deny_followup_tokens(PLAIN_DIALOG),
+            Some(&[KeyToken::Named("Escape")][..])
+        );
+        let hintless = PLAIN_DIALOG.replace("ctrl+f fullscreen", "");
+        assert_eq!(
+            deny_followup_tokens(&hintless),
+            Some(&[KeyToken::Named("Escape")][..])
+        );
+    }
+
+    #[test]
+    fn deny_collapses_then_escapes_again_then_stops_once_the_dialog_is_gone() {
+        let mut pane = FakePane::dialog(3, 2);
+        pane.plain = vec![EXPANDED_PLAIN, PLAIN_DIALOG, OPENCODE_2X_TOOL_DONE];
+        respond(&pane, PermissionResponseChoice::Deny).expect("denied");
+        assert_eq!(pane.sent(), ["Escape", "Escape", "Escape"]);
+        assert!(pane.enter_on.borrow().is_empty());
+    }
+
+    #[test]
+    fn deny_confirms_the_reject_stage_after_a_collapse_that_left_the_dialog() {
+        let mut pane = FakePane::dialog(3, 2);
+        pane.plain = vec![
+            EXPANDED_PLAIN,
+            PLAIN_DIALOG,
+            SUBAGENT_REJECT_STAGE,
+            OPENCODE_2X_TOOL_DONE,
+        ];
+        respond(&pane, PermissionResponseChoice::Deny).expect("denied");
+        assert_eq!(pane.sent(), ["Escape", "Escape", "Escape", "Enter"]);
     }
 
     /// Stand-in for a pane running an opencode dialog: arrow keys rotate the
@@ -784,7 +825,7 @@ mod permission_response_tokens_tests {
     #[test]
     fn deny_collapses_the_expanded_dialog_then_confirms_the_subagent_prompt() {
         let mut pane = FakePane::dialog(3, 2);
-        pane.plain = vec![EXPANDED_PLAIN, SUBAGENT_REJECT_STAGE, PLAIN_DIALOG];
+        pane.plain = vec![EXPANDED_PLAIN, SUBAGENT_REJECT_STAGE, OPENCODE_2X_TOOL_DONE];
         respond(&pane, PermissionResponseChoice::Deny).expect("denied");
         assert_eq!(pane.sent(), ["Escape", "Escape", "Enter"]);
     }
@@ -792,7 +833,7 @@ mod permission_response_tokens_tests {
     #[test]
     fn deny_confirms_the_subagent_prompt_without_expanding() {
         let mut pane = FakePane::dialog(3, 0);
-        pane.plain = vec![SUBAGENT_REJECT_STAGE, PLAIN_DIALOG];
+        pane.plain = vec![SUBAGENT_REJECT_STAGE, OPENCODE_2X_TOOL_DONE];
         respond(&pane, PermissionResponseChoice::Deny).expect("denied");
         assert_eq!(pane.sent(), ["Escape", "Enter"]);
     }
@@ -803,6 +844,15 @@ mod permission_response_tokens_tests {
         pane.plain = vec![EXPANDED_PLAIN];
         respond(&pane, PermissionResponseChoice::Deny).expect("denied");
         assert_eq!(pane.sent(), ["Escape", "Escape", "Escape", "Escape"]);
+    }
+
+    #[test]
+    fn deny_gives_up_after_three_rounds_on_a_collapsed_dialog_that_never_goes() {
+        let mut pane = FakePane::dialog(3, 0);
+        pane.plain = vec![PLAIN_DIALOG];
+        respond(&pane, PermissionResponseChoice::Deny).expect("denied");
+        assert_eq!(pane.sent(), ["Escape", "Escape", "Escape", "Escape"]);
+        assert!(pane.enter_on.borrow().is_empty());
     }
 
     #[test]
