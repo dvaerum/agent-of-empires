@@ -1503,8 +1503,23 @@ fn agent_help_advertises(command: &std::process::Command, flag: &str) -> bool {
     with_agent_help(command, true, |help| help_advertises_flag(help, flag))
 }
 
+/// Tests that assert exact probe counts pin the cache so another test's
+/// [`forget_agent_help_for_test`] cannot wipe their cooldown mid-run.
+#[cfg(test)]
+static HELP_CACHE_PIN: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(test)]
+pub(crate) fn pin_agent_help_for_test() -> std::sync::RwLockReadGuard<'static, ()> {
+    HELP_CACHE_PIN
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 pub(crate) fn forget_agent_help_for_test() {
+    let _unpinned = HELP_CACHE_PIN
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     HELP_PROBES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1849,6 +1864,8 @@ mod tests {
     #[test]
     fn naming_reprobes_success_without_losing_context_failure_cooldown() {
         use std::os::unix::fs::PermissionsExt;
+        // The probe cache is process-global and many tests clear it; hold it for the whole run.
+        let pinned = pin_agent_help_for_test();
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("claude");
         let response = directory.path().join("help");
@@ -1866,6 +1883,9 @@ mod tests {
             .env("AOE_SESSION_SOURCE", "failed-launch");
         std::fs::write(&response, "").unwrap();
         assert_eq!(agent.supported_session_name_flag(&command), None);
+        // Another test wiping the shared cache here would re-probe the cooled-down context.
+        let concurrent_forget = std::thread::spawn(forget_agent_help_for_test);
+        std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&response, "--name <name>\n").unwrap();
         assert_eq!(agent.supported_session_name_flag(&command), None);
         command.env("AOE_SESSION_SOURCE", "fresh-launch");
@@ -1878,6 +1898,8 @@ mod tests {
             std::fs::read_to_string(probes).unwrap(),
             "failed-launch\nfresh-launch\nfresh-launch\nfresh-launch\n"
         );
+        drop(pinned);
+        concurrent_forget.join().unwrap();
     }
     #[test]
     fn terminal_tool_for_acp_agent_maps_only_built_in_terminal_tools() {

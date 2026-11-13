@@ -3669,11 +3669,9 @@ mod durable_stop_tests {
     #[serial_test::serial]
     async fn managed_resume_refusal_publishes_safe_recovery_without_replacing_the_pane() {
         use crate::tmux::test_helpers::{
-            only_pane_id, pane_field, tmux_available, wait_for_pane_command, TmuxTestSession,
+            only_pane_id, pane_field, require_tmux, wait_for_pane_command, TmuxTestSession,
         };
-        if !tmux_available() {
-            return;
-        }
+        require_tmux!();
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(root.path());
         let _env = crate::session::test_support::EnvGuard::unset(&[
@@ -3784,7 +3782,7 @@ mod durable_stop_tests {
                     "-d",
                     "-s",
                     &name,
-                    "exec /bin/sleep 60"
+                    "exec sleep 60"
                 ])
                 .output()
                 .unwrap()
