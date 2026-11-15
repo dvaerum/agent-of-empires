@@ -1,0 +1,48 @@
+# FIXTURE: OpenCode - Waiting_permission State
+# Captured from: 2.2.5 TUI in a throwaway tmux pane against a mock OpenAI-compatible server
+# Capture date: 2026-11-08
+# Verified against: 2.2.5 (last check: 2026-11-08)
+#
+# Expected status: Waiting
+# Key indicators: "△ Permission required" with "Allow once / Always allow / Reject"
+
+
+ ! New session                   +
+
+  ┃
+  ┃  hello SLOWME
+  ┃
+
+     lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem
+     ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum
+     dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem
+
+     Build · mock · 8.4s · interrupted
+
+  ┃
+  ┃  run TOOLME
+  ┃
+
+  ┃
+  ┃  ⠹ whoami
+  ┃
+
+     Press ctrl+b to move running work to the background
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃  △ Permission required
+  ┃
+  ┃  $ whoami
+  ┃
+  ┃
+  ┃   Allow once   Always allow   Reject                                 ctrl+f fullscreen  ⇆ select  enter confirm
+  ┃

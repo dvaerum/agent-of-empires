@@ -1,0 +1,40 @@
+   done                          ! done                          +
+     Build · m · 10.5s · 50.0 tok/s · interrupted
+
+  ┃
+  ┃  DO_EXT
+  ┃
+
+  ┃
+  ┃  $ cd /usr && ls
+  ┃
+  ┃  The user declined this tool call
+  ┃
+
+     Build · m · 10.1s · 6.7 tok/s · interrupted
+
+  ┃
+  ┃  DO_QUESTION
+  ┃
+
+     → Asked 1 question
+
+     Build · m · 23.2s · 6.1 tok/s · interrupted
+
+  ┃
+  ┃  DO_TASK
+  ┃
+
+     ⠴ General Subagent — sub task
+
+     Press ctrl+b to move running work to the background
+
+  ┃
+  ┃  △ Reject permission
+  ┃
+  ┃  Tell OpenCode what to do differently
+  ┃
+  ┃
+  ┃                                                                                       enter confirm  esc cancel
+  ┃
+
