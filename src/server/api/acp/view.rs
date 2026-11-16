@@ -744,7 +744,7 @@ async fn agent_terminal_plan(
             },
         );
     }
-    if !crate::agents::acp_transcript_cli_resumable(&instance.tool, agent) {
+    if !crate::agents::acp_terminal_handoff_keeps_context(&instance.tool, agent) {
         return Ok(TerminalPlan::StartsFresh(AgentNotResumable));
     }
     let Some(sid) = instance.acp_session_id.as_deref() else {

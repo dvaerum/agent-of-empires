@@ -1554,6 +1554,15 @@ pub fn acp_transcript_cli_resumable(tool: &str, acp_agent: &str) -> bool {
     tool == "claude" && matches!(acp_agent, "claude" | "claude-code")
 }
 
+/// Whether a switch from structured to terminal view can hand the live
+/// conversation to the terminal tool. Wider than `acp_transcript_cli_resumable`:
+/// `opencode acp` returns the `ses_` id `opencode --session` resumes, but only
+/// the terminal direction proves the id against opencode's database, so the
+/// terminal-to-structured seed stays claude-only.
+pub fn acp_terminal_handoff_keeps_context(tool: &str, acp_agent: &str) -> bool {
+    acp_transcript_cli_resumable(tool, acp_agent) || (tool == "opencode" && acp_agent == "opencode")
+}
+
 fn configured_status_map<'a>(
     config: &'a crate::session::config::Config,
     agent_name: &str,
@@ -1917,6 +1926,17 @@ mod tests {
         ] {
             assert_eq!(terminal_tool_for_acp_agent(agent), tool, "{agent}");
         }
+    }
+
+    #[test]
+    fn terminal_handoff_keeps_context_for_claude_and_opencode_pairings() {
+        assert!(acp_terminal_handoff_keeps_context("claude", "claude-code"));
+        assert!(acp_terminal_handoff_keeps_context("opencode", "opencode"));
+        assert!(!acp_terminal_handoff_keeps_context("opencode", "claude"));
+        assert!(!acp_terminal_handoff_keeps_context("opencode", "codex"));
+        assert!(!acp_terminal_handoff_keeps_context("codex", "codex"));
+        // The seed for terminal-to-structured stays claude-only.
+        assert!(!acp_transcript_cli_resumable("opencode", "opencode"));
     }
 
     #[test]
