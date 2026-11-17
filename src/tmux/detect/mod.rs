@@ -81,12 +81,15 @@ pub struct Detection<'a> {
     pub diagnostic: Option<&'a str>,
 }
 
+/// The rule id of a capture that matched nothing.
+pub(crate) const NO_RULE: &str = "no_rule";
+
 impl Detection<'_> {
     pub(crate) fn idle_by_default() -> Self {
         Self {
             status: Some(Status::Idle),
             visible: false,
-            rule: "no_rule",
+            rule: NO_RULE,
             diagnostic: None,
         }
     }

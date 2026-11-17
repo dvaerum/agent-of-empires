@@ -3735,6 +3735,26 @@ pub(crate) fn register_live_for_test(
     channel
 }
 
+/// Like [`register_live_for_test`], but the channel holds `pane_id` as its
+/// target, the way a real channel holds the pane it armed against.
+#[cfg(test)]
+pub(crate) fn register_live_on_pane_for_test(
+    name: &str,
+    dir: &std::path::Path,
+    pane_id: &str,
+) -> Arc<VtChannel> {
+    let (mut channel, lifecycle) = dummy_channel_with_input(name, dir, false);
+    Arc::get_mut(&mut channel)
+        .expect("a fresh test channel has one owner")
+        .target = pane_id.to_string();
+    VtLifecycle::Live.store(&lifecycle);
+    REGISTRY
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), Arc::downgrade(&channel));
+    channel
+}
+
 #[cfg(test)]
 pub(crate) struct HeldVtDrain {
     drain: Arc<Mutex<DrainControl>>,

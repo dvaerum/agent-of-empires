@@ -1276,11 +1276,24 @@ impl Session {
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<String> {
         #[cfg(unix)]
-        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name) {
-            return Ok(id);
+        let held = crate::tmux::vt::channel_pane_id(&self.name);
+        #[cfg(not(unix))]
+        let held: Option<String> = None;
+        // A held channel names the pane it armed against, and it outlives a stop+start of the
+        // session whose new pane has a new id. Trust the held id only while the session still
+        // owns that pane.
+        match super::utils::first_window_pane_ids_with_deadline(&self.name, deadline) {
+            Some(ids) => match held.filter(|held| ids.contains(held)) {
+                Some(held) => Ok(held),
+                None => ids
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("No agent pane in session {}", self.name)),
+            },
+            // The pane list could not be read (tmux slow, or the session just went away): keep
+            // the held pane, as before, and let the command that uses it report the failure.
+            None => held.ok_or_else(|| anyhow::anyhow!("No agent pane in session {}", self.name)),
         }
-        super::utils::first_pane_id_with_deadline(&self.name, deadline)
-            .ok_or_else(|| anyhow::anyhow!("No agent pane in session {}", self.name))
     }
 
     pub(crate) fn capture_pane_with_cursor_with_deadline(
@@ -6185,6 +6198,123 @@ mod tests {
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
         );
+    }
+
+    fn spawn_detached_session(name: &str, launch: &str) {
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-x",
+            "40",
+            "-y",
+            "10",
+            launch,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        append_pane_base_index_args(&mut args, name);
+        let created = crate::tmux::tmux_command()
+            .args(args)
+            .output()
+            .expect("spawn tmux");
+        assert!(
+            created.status.success(),
+            "tmux new-session failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+    }
+
+    fn kill_detached_session(name: &str) {
+        let killed = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &format!("={name}")])
+            .output()
+            .expect("kill tmux session");
+        assert!(killed.status.success(), "tmux kill-session failed");
+    }
+
+    /// A stop+start recreates the pane under a new id while a web terminal
+    /// still holds the old generation's channel; every pane read and write must
+    /// follow the session to its current pane, not the dead id.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_held_channel_on_a_replaced_pane_does_not_steer_the_target() {
+        require_tmux!();
+        let guard = TmuxTestSession::new("aoe_test_stale_chan");
+        let name = guard.name().to_string();
+        // The real tmux server outlives a stopped session; without a second session the
+        // test server exits with the last one and numbers panes from %0 again.
+        let keeper = TmuxTestSession::new("aoe_test_stale_chan_keeper");
+        spawn_detached_session(keeper.name(), "sh -c 'sleep 60'");
+        spawn_detached_session(&name, "sh -c 'printf old; sleep 60'");
+        let old_pane = only_pane_id(&name);
+        let dir = tempfile::tempdir().expect("channel dir");
+        let _channel =
+            crate::tmux::vt::register_live_on_pane_for_test(&name, dir.path(), &old_pane);
+
+        kill_detached_session(&name);
+        spawn_detached_session(&name, "sh -c 'printf fresh; sleep 60'");
+        let new_pane = only_pane_id(&name);
+        assert_ne!(old_pane, new_pane, "tmux must hand the new pane a new id");
+
+        let session = Session::from_name(&name);
+        let target = session
+            .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+            .expect("a target");
+        assert_eq!(target, new_pane, "stale held pane id was used");
+
+        let mut captured = String::new();
+        for _ in 0..50 {
+            captured = session.capture_pane(5).expect("capture");
+            if captured.contains("fresh") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            captured.contains("fresh"),
+            "capture read nothing of the current pane: {captured:?}"
+        );
+        crate::tmux::vt::unregister_for_test(&name);
+    }
+
+    /// The held pane stays the target while it is still in the session, even
+    /// when it is not the first one.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_held_channel_on_a_live_pane_keeps_the_target() {
+        require_tmux!();
+        let guard = TmuxTestSession::new("aoe_test_live_chan");
+        let name = guard.name().to_string();
+        spawn_detached_session(&name, "sh -c 'sleep 60'");
+        let split = crate::tmux::tmux_command()
+            .args([
+                "split-window",
+                "-d",
+                "-t",
+                &format!("={name}:"),
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "sh -c 'sleep 60'",
+            ])
+            .output()
+            .expect("split pane");
+        assert!(split.status.success(), "split-window failed");
+        let second = String::from_utf8_lossy(&split.stdout).trim().to_string();
+        assert_ne!(second, only_pane_id(&name), "need a second pane");
+
+        let dir = tempfile::tempdir().expect("channel dir");
+        let _channel = crate::tmux::vt::register_live_on_pane_for_test(&name, dir.path(), &second);
+        let target = Session::from_name(&name)
+            .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+            .expect("a target");
+        assert_eq!(target, second);
+        crate::tmux::vt::unregister_for_test(&name);
     }
 
     /// respawn_dead_pane on a non-existent session is a safe no-op.

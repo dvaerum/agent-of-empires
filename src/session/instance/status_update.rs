@@ -610,7 +610,17 @@ impl Instance {
             &self.tool,
         );
 
-        let confirmed = self.confirm_detection(candidate, detection.visible);
+        // A launch that has drawn nothing is not ready: an empty screen matches no rule, which
+        // reads as Idle, and a hung agent would then look ready for good.
+        let still_blank_launch = self.status == Status::Starting
+            && candidate == Status::Idle
+            && detection.rule == tmux::detect::NO_RULE
+            && clean.trim().is_empty();
+        let confirmed = if still_blank_launch {
+            None
+        } else {
+            self.confirm_detection(candidate, detection.visible)
+        };
         if let Some(status) = confirmed {
             self.status = status;
             if status == Status::Error {
@@ -1453,6 +1463,125 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             "one observation is all this caller gets, so its proposal decides (#3712)"
         );
         assert_eq!(once.detection.pending, None);
+    }
+
+    /// A launch that has drawn nothing is not ready, however long ago the startup grace ended; the
+    /// first drawn frame still decides at once.
+    #[test]
+    #[serial_test::serial]
+    fn a_launch_that_has_drawn_nothing_stays_starting() {
+        let home = crate::session::test_support::isolate_app_dir();
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        let marker = home.path().join("drawn");
+        let mut launching = Instance::new("aoe_test_blank_launch", "/tmp");
+        launching.tool = "opencode".into();
+        launching.view = crate::session::View::Terminal;
+        launching.status = Status::Starting;
+        let session_name = tmux::Session::generate_name(&launching.id, &launching.title);
+        // A wedged agent: the pane exists and draws nothing until the marker appears.
+        let _guard = spawn_pane(
+            &session_name,
+            &format!(
+                "until [ -f {} ]; do sleep 0.05; done; echo 'Ask anything'; sleep 300",
+                shell_quote(&marker)
+            ),
+        );
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        // An unchanged activity second must not freeze a Starting row either.
+        let poll = |inst: &mut Instance| {
+            cache.force_present(&[session_name.as_str()]);
+            let metadata = agent_pane_metadata("opencode", Some(0));
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        };
+
+        for round in 0..2 {
+            poll(&mut launching);
+            assert_eq!(launching.status, Status::Starting, "blank poll {round}");
+            assert_eq!(
+                launching.detection.rule,
+                Some("no_rule"),
+                "blank poll {round}"
+            );
+        }
+
+        // A row that was already decided is not demoted by a blank frame.
+        let mut settled = Instance::new("aoe_test_blank_settled", "/tmp");
+        settled.tool = "opencode".into();
+        settled.view = crate::session::View::Terminal;
+        settled.status = Status::Idle;
+        poll(&mut settled);
+        assert_eq!(settled.status, Status::Idle);
+
+        std::fs::File::create(&marker).expect("touch marker");
+        assert!(
+            wait_for_pane(&session_name, "Ask anything"),
+            "the first frame never painted"
+        );
+        poll(&mut launching);
+        assert_eq!(
+            launching.status,
+            Status::Idle,
+            "a drawn frame must end Starting on the next poll"
+        );
+    }
+
+    /// A web terminal that stays open across a stop+start holds the old pane's
+    /// live channel while the restart gives the session a new pane id. The
+    /// restarted launch must still be read from its own pane, or its capture is
+    /// blank and the row stays Starting for as long as the tab is open.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_held_channel_on_the_replaced_pane_does_not_keep_a_restart_starting() {
+        let home = crate::session::test_support::isolate_app_dir();
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        let mut launching = Instance::new("aoe_test_stale_channel", "/tmp");
+        launching.tool = "opencode".into();
+        launching.view = crate::session::View::Terminal;
+        launching.status = Status::Starting;
+        let session_name = tmux::Session::generate_name(&launching.id, &launching.title);
+
+        // The real tmux server outlives a stopped session; without a second session the
+        // test server exits with the last one and numbers panes from %0 again.
+        let _keeper = spawn_pane(&format!("{session_name}_keeper"), "sleep 300");
+        let first_run = spawn_pane(&session_name, "echo 'Ask anything'; sleep 300");
+        assert!(wait_for_pane(&session_name, "Ask anything"));
+        let old_pane = tmux::test_helpers::only_pane_id(&session_name);
+        let channel_dir = home.path().join("channel");
+        std::fs::create_dir_all(&channel_dir).expect("channel dir");
+        let _channel =
+            tmux::vt::register_live_on_pane_for_test(&session_name, &channel_dir, &old_pane);
+
+        // The stop: the pane goes away. The start: a new pane, a new id.
+        drop(first_run);
+        let _second_run = spawn_pane(&session_name, "echo 'Ask anything'; sleep 300");
+        assert!(wait_for_pane(&session_name, "Ask anything"));
+        assert_ne!(
+            tmux::test_helpers::only_pane_id(&session_name),
+            old_pane,
+            "tmux must hand the restarted pane a new id"
+        );
+
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session_name.as_str()]);
+        let metadata = agent_pane_metadata("opencode", Some(0));
+        launching.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        tmux::vt::unregister_for_test(&session_name);
+
+        assert_eq!(
+            launching.status,
+            Status::Idle,
+            "the restarted pane drew its prompt; detection {:?}",
+            launching.detection
+        );
     }
 
     #[test]
