@@ -81,6 +81,68 @@ pub(crate) fn generate_session_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Whether `session_id` is provably NOT in opencode's on-host session store.
+///
+/// The opencode analogue of [`claude_host_transcript_confirmed_absent`]: a
+/// seeded structured-view `session/load <id>` hard-fails on a missing id, so
+/// the terminal -> structured keep-context switch must only carry an
+/// `agent_session_id` it can confirm exists. Reads opencode's SQLite store
+/// via the same [`crate::acp::acp_client::opencode::opencode_db_path`] lookup
+/// its own prompt-error recovery uses; an id present in the `session` or `session_v2` table
+/// is exactly what `opencode --session <id>` and `session/load` resume.
+///
+/// Fail-open, matching the claude helper: if the store can't be located or
+/// read (missing, locked, schema drift, IO), return `false` ("not confirmed
+/// absent") so the caller attempts the load rather than silently dropping a
+/// live transcript. Only an authoritative, readable store with no matching
+/// row returns `true`.
+pub(crate) fn opencode_host_transcript_confirmed_absent(session_id: &str) -> bool {
+    use rusqlite::{Connection, OpenFlags};
+
+    let Some(db_path) = crate::acp::acp_client::opencode::opencode_db_path() else {
+        return false;
+    };
+    if !db_path.exists() {
+        return false;
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let _ = conn.busy_timeout(Duration::from_millis(100));
+    // 2.x keeps new sessions in `session_v2` and freezes the migrated `session`
+    // table; either may hold the id, and either may be the only table.
+    let mut searched = false;
+    for (table, sql) in [
+        ("session", "SELECT 1 FROM session WHERE id = ?1 LIMIT 1"),
+        (
+            "session_v2",
+            "SELECT 1 FROM session_v2 WHERE id = ?1 LIMIT 1",
+        ),
+    ] {
+        match conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        ) {
+            Ok(()) => {}
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(_) => return false,
+        }
+        match conn
+            .prepare(sql)
+            .and_then(|mut stmt| stmt.exists(rusqlite::params![session_id]))
+        {
+            Ok(true) => return false,
+            Ok(false) => searched = true,
+            Err(_) => return false,
+        }
+    }
+    searched
+}
+
 pub(crate) const MAX_SESSION_ID_LEN: usize = 256;
 
 pub(crate) fn is_valid_session_id(id: &str) -> bool {
@@ -467,6 +529,117 @@ mod tests {
         ] {
             assert!(!is_valid_session_id(invalid), "{invalid}");
         }
+    }
+
+    #[test]
+    fn opencode_host_transcript_confirmed_absent_reports_presence_and_fails_open() {
+        // Gates the opencode terminal->structured keep-context switch: the
+        // seed may only carry an agent_session_id the on-host store confirms,
+        // and must fail open (attempt the load) when the store is unreadable
+        // rather than silently dropping a live transcript.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session (id) VALUES (?1)",
+            rusqlite::params!["ses_here"],
+        )
+        .unwrap();
+        drop(conn);
+
+        {
+            let _env = crate::session::test_support::EnvGuard::set(&[("OPENCODE_DB", &db_path)]);
+            // Present in a readable store -> not confirmed absent (load succeeds).
+            assert!(!opencode_host_transcript_confirmed_absent("ses_here"));
+            // Absent from a readable store -> confirmed absent (do not seed it).
+            assert!(opencode_host_transcript_confirmed_absent("ses_missing"));
+        }
+        {
+            // Fail-open: an unreadable/missing store must not confirm absence.
+            let gone = dir.path().join("gone.db");
+            let _env = crate::session::test_support::EnvGuard::set(&[("OPENCODE_DB", &gone)]);
+            assert!(!opencode_host_transcript_confirmed_absent("ses_here"));
+        }
+    }
+
+    #[test]
+    fn opencode_host_transcript_confirmed_absent_reads_every_session_table() {
+        // 2.x writes new sessions to `session_v2` and freezes the legacy `session`
+        // table once it has migrated its rows, so a store can hold either or both.
+        let columns = "(id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL)";
+        for (label, ddl, id, absent) in [
+            (
+                "2.x store: session_v2 only, present",
+                format!("CREATE TABLE session_v2 {columns}; INSERT INTO session_v2 VALUES ('ses_new', NULL, '/p')"),
+                "ses_new",
+                false,
+            ),
+            (
+                "2.x store: session_v2 only, missing",
+                format!("CREATE TABLE session_v2 {columns}; INSERT INTO session_v2 VALUES ('ses_new', NULL, '/p')"),
+                "ses_missing",
+                true,
+            ),
+            (
+                "migrated store: id created after migration lives only in session_v2",
+                format!("CREATE TABLE session {columns}; CREATE TABLE session_v2 {columns}; INSERT INTO session VALUES ('ses_old', NULL, '/p'); INSERT INTO session_v2 VALUES ('ses_new', NULL, '/p')"),
+                "ses_new",
+                false,
+            ),
+            (
+                "migrated store: id only in the frozen legacy table",
+                format!("CREATE TABLE session {columns}; CREATE TABLE session_v2 {columns}; INSERT INTO session VALUES ('ses_old', NULL, '/p')"),
+                "ses_old",
+                false,
+            ),
+            (
+                "migrated store: id in neither table",
+                format!("CREATE TABLE session {columns}; CREATE TABLE session_v2 {columns}; INSERT INTO session VALUES ('ses_old', NULL, '/p')"),
+                "ses_missing",
+                true,
+            ),
+            (
+                "1.x store: session only, present",
+                format!("CREATE TABLE session {columns}; INSERT INTO session VALUES ('ses_old', NULL, '/p')"),
+                "ses_old",
+                false,
+            ),
+            (
+                "store with no session table at all fails open",
+                "CREATE TABLE unrelated (x TEXT)".into(),
+                "ses_old",
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("opencode.db");
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .execute_batch(&ddl)
+                .unwrap();
+            let _env = crate::session::test_support::EnvGuard::set(&[("OPENCODE_DB", &db_path)]);
+            assert_eq!(
+                opencode_host_transcript_confirmed_absent(id),
+                absent,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_exclusion_set_empty() {
+        let result = build_exclusion_set(
+            "nonexistent-instance-id-12345",
+            &crate::tmux::LiveSessionSnapshot::new(),
+            None,
+        );
+        // The exclusion set should never contain our own instance ID
+        // (it collects OTHER instances' captured session IDs).
+        // On a machine with active AoE tmux sessions, the set may be
+        // non-empty, so we verify our own ID isn't self-excluded.
+        assert!(!result.contains("nonexistent-instance-id-12345"));
     }
 
     #[cfg(unix)]
