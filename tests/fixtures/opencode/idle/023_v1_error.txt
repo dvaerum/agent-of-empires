@@ -1,0 +1,48 @@
+# FIXTURE: OpenCode - Idle State
+# Captured from: 1.18.31 TUI in a throwaway tmux pane against a mock OpenAI-compatible server
+# Capture date: 2026-11-08
+# Verified against: 1.18.31 (last check: 2026-11-08)
+#
+# Expected status: Idle
+# Key indicators: provider error toast, no interrupt footer
+
+
+  ┃
+  ┃  run TOOLME
+  ┃                                                                                   ┃                              ┃
+                                                                                      ┃  Incorrect API key provided  ┃
+     $ nproc                                                                          ┃                              ┃
+
+  ┃
+  ┃  ask QUESTIONME
+  ┃
+
+     → Asked 1 question
+
+  ──────────────────────────────────────────────────── Compaction ────────────────────────────────────────────────────
+
+  ┃
+  ┃  Tool call not allowed while generating summary: question
+  ┃
+
+  ┃
+  ┃  please ERRORME
+  ┃
+
+  ┃
+  ┃  now ERRFATAL
+  ┃
+
+  ┃
+  ┃  Incorrect API key provided
+  ┃
+
+     ▣  Compaction · mock
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · mock Mock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /tmp/fixture/     tab agentsctrl+p
+   work                                                                                  commands

@@ -104,6 +104,7 @@ mod opencode {
         for (state, expected) in [
             ("running", Status::Running),
             ("waiting_permission", Status::Waiting),
+            ("waiting_question", Status::Waiting),
             ("idle", Status::Idle),
         ] {
             test_all_fixtures_in_dir("opencode", state, expected, identity, detect);

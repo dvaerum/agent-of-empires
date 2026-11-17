@@ -1,0 +1,48 @@
+# FIXTURE: OpenCode - Waiting_question State
+# Captured from: 1.18.31 TUI in a throwaway tmux pane against a mock OpenAI-compatible server
+# Capture date: 2026-11-08
+# Verified against: 1.18.31 (last check: 2026-11-08)
+#
+# Expected status: Waiting
+# Key indicators: question tool list "enter submit  esc dismiss"
+
+
+  ┃
+
+  ┃
+  ┃  $ free -m
+  ┃
+  ┃  total        used        free      shared  buff/cache   available
+  ┃  Mem:        1000        1000        1000        1000        1000        1000
+  ┃  Swap:          40497       13038       27459
+  ┃
+
+     Done, the tool finished.
+
+     ▣  Build · mock · 5.5s
+
+  ┃
+  ┃  run TOOLME
+  ┃
+
+     $ nproc
+
+  ┃
+  ┃  ask QUESTIONME
+  ┃
+
+     → Asked 1 question
+
+     ▣  Build · mock
+
+  ┃
+  ┃  Which colour?
+  ┃
+  ┃  1. Red
+  ┃     red
+  ┃  2. Blue
+  ┃     blue
+  ┃  3. Type your own answer
+  ┃
+  ┃  ↑↓ select  enter submit  esc dismiss
+  ┃
