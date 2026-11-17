@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState, type ActivityRow, type TranscriptRow } from "../../lib/acpTypes";
+import { emptyAcpState, type AcpFrame, type ActivityRow, type TranscriptRow } from "../../lib/acpTypes";
 import { reducer } from "./reducer";
 import { fetchReplay } from "./replay";
 
-type Page = { rows: TranscriptRow[]; next_cursor: number | null; has_more: boolean; highest_seq?: number };
+type Page = {
+  rows: TranscriptRow[];
+  next_cursor: number | null;
+  has_more: boolean;
+  highest_seq?: number;
+  frames?: AcpFrame[];
+};
 
 const row = (id: string, kind: TranscriptRow["kind"]): TranscriptRow => ({
   id,
@@ -16,7 +22,7 @@ const row = (id: string, kind: TranscriptRow["kind"]): TranscriptRow => ({
 
 // `pages` are keyed by the `before` cursor they answer; the tail answers `before=MAX_SAFE_INTEGER`.
 // `since` pages answer `since=N` by cursor; the rows view carries `rows`, the frames view none.
-function mockReplay(pages: Record<string, Page>, since: Record<string, TranscriptRow[]> = {}) {
+function mockReplay(pages: Record<string, Page>, since: Record<string, TranscriptRow[]> = {}, sinceHighest = 3000) {
   const requests: string[] = [];
   vi.stubGlobal(
     "fetch",
@@ -25,7 +31,7 @@ function mockReplay(pages: Record<string, Page>, since: Record<string, Transcrip
       const params = new URLSearchParams(url.split("?")[1]);
       if (params.has("since")) {
         const rows = params.get("view") === "rows" ? (since[params.get("since")!] ?? []) : null;
-        return new Response(JSON.stringify({ frames: [], rows, lost: false, highest_seq: 3000 }));
+        return new Response(JSON.stringify({ frames: [], rows, lost: false, highest_seq: sinceHighest }));
       }
       const page = pages[params.get("before") ?? ""] ?? { rows: [], next_cursor: null, has_more: false };
       const body = params.has("before")
@@ -54,7 +60,7 @@ afterEach(() => vi.unstubAllGlobals());
 describe("rows recovery for a cached cursor without history", () => {
   it("loads the transcript from the tail, then folds frames forward from the cached cursor", async () => {
     const requests = mockReplay({
-      [TAIL]: { rows: [row("t1", "tool_start")], next_cursor: 80, has_more: true },
+      [TAIL]: { rows: [row("t1", "tool_start")], next_cursor: 80, has_more: true, highest_seq: 3000 },
       "80": { rows: [row("u", "user_prompt")], next_cursor: 40, has_more: true },
     });
     const { frames, cursor, handshakes } = await reopen(undefined, 900);
@@ -267,5 +273,84 @@ describe("fetchTail", () => {
     });
     const { frames } = await coldOpen(abort.signal);
     expect(frames).toEqual([]);
+  });
+});
+
+describe("a log that restarted below the cached cursor", () => {
+  // The handoff to the terminal deletes the event log, so the next worker numbers its events from 1 again.
+  const stale = {
+    ...emptyAcpState(),
+    lastSeq: 19,
+    workerStopped: true,
+    turnActive: true,
+    serverTurnActive: true,
+    activity: [{ id: "old-user", kind: "user_prompt", text: "old", at: "2026-01-01T00:00:00Z" } as ActivityRow],
+  };
+  const newFrames: AcpFrame[] = [{ session_id: "sid", seq: 12, event: "ThinkingStarted" }];
+  const newLog = {
+    [TAIL]: {
+      rows: [row("new-user", "user_prompt")],
+      next_cursor: 1,
+      has_more: false,
+      highest_seq: 12,
+      frames: newFrames,
+    },
+  };
+
+  const run = async (lastSeq: number, oldestSeq: number) => {
+    const requests = mockReplay(newLog, { "0": [row("new-user", "user_prompt")] }, 12);
+    const actions: Parameters<typeof reducer>[1][] = [];
+    const cursor = { current: lastSeq };
+    await fetchReplay("sid", cursor, oldestSeq, (a) => actions.push(a), vi.fn(), new AbortController().signal);
+    return { requests, actions, cursor, state: actions.reduce(reducer, { ...stale, lastSeq, oldestSeq }) };
+  };
+
+  it.each([
+    ["history is loaded (forward path)", 40],
+    ["only a cursor is cached (tail path)", 0],
+  ])("resets and reloads the new log when %s", async (_name, oldestSeq) => {
+    const { actions, cursor, state } = await run(19, oldestSeq);
+    expect(actions.some((a) => a.kind === "reset")).toBe(true);
+    // The dial reads this ref before React commits, so it must already be on the new log.
+    expect(cursor.current).toBe(12);
+    expect(state.lastSeq).toBe(12);
+    expect(state.workerStopped).toBe(false);
+    expect(state.activity.map((r) => r.id)).toEqual(["new-user"]);
+  });
+
+  it.each([
+    ["history is loaded", 40],
+    ["only a cursor is cached", 0],
+  ])("resets a cursor more than the overlap window ahead of the log (%s)", async (_name, oldestSeq) => {
+    const { actions, cursor, state } = await run(500, oldestSeq);
+    expect(actions.some((a) => a.kind === "reset")).toBe(true);
+    expect(cursor.current).toBe(12);
+    expect(state.activity.map((r) => r.id)).toEqual(["new-user"]);
+  });
+
+  it("resets to an empty cursor when the new log has no events yet", async () => {
+    mockReplay({ [TAIL]: { rows: [], next_cursor: null, has_more: false, highest_seq: 0 } }, {}, 0);
+    const actions: Parameters<typeof reducer>[1][] = [];
+    const cursor = { current: 19 };
+    await fetchReplay("sid", cursor, 40, (a) => actions.push(a), vi.fn(), new AbortController().signal);
+    const state = actions.reduce(reducer, stale);
+    expect(cursor.current).toBe(0);
+    expect(state).toMatchObject({ lastSeq: 0, workerStopped: false, activity: [] });
+  });
+
+  it.each([
+    ["history is loaded", 40],
+    ["only a cursor is cached", 0],
+  ])("keeps the cached state when the log has not moved back (%s)", async (_name, oldestSeq) => {
+    mockReplay(
+      { [TAIL]: { rows: [row("u", "user_prompt")], next_cursor: 1, has_more: false, highest_seq: 19 } },
+      {},
+      19,
+    );
+    const actions: Parameters<typeof reducer>[1][] = [];
+    const cursor = { current: 19 };
+    await fetchReplay("sid", cursor, oldestSeq, (a) => actions.push(a), vi.fn(), new AbortController().signal);
+    expect(actions.some((a) => a.kind === "reset")).toBe(false);
+    expect(cursor.current).toBe(19);
   });
 });

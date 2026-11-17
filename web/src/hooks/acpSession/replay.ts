@@ -36,8 +36,12 @@ const getReplayPair = (sid: string, params: string, signal: AbortSignal): Promis
 const readRows = async (res: Response): Promise<TranscriptRow[]> =>
   ((await res.json()) as ReplayPageResponse).rows ?? [];
 
+/** The server's log ends below our cursor: it was deleted and renumbered, so cached state describes another log. */
+class LogRewound extends Error {}
+
 /**
- * Catch up from `lastSeq.current`, updating it on a cold open. A state with a cursor but no loaded history
+ * Catch up from `lastSeq.current`, updating it on a cold open. A log that rewound below the cursor drops the cached
+ * state and reloads from the tail. A state with a cursor but no loaded history
  * (`oldestSeq` 0) recovers its transcript from the tail, then folds frames forward from its own cursor; the
  * tail is published only once that catch-up succeeds, so a failed one cannot leave a tail the socket snapshot
  * would append older rows after.
@@ -54,21 +58,41 @@ export async function fetchReplay(
   signal: AbortSignal,
 ): Promise<void> {
   try {
-    if (lastSeq.current === 0) await fetchTail(sid, lastSeq, null, dispatch, setHasMoreOlder, signal);
-    else if (oldestSeq === 0) {
-      // Cached control state is cursor-aware and must see each frame once, from its own cursor. Forward rows
-      // from that cursor would append older turns after the recovered tail, so rows resume exactly at the tail's end.
-      const from = lastSeq.current;
-      const catchUp: CatchUp = async (tailEnd, emit) => {
-        const reached = await fetchForward(sid, from, emit, signal, "frames");
-        if (reached === null || (await fetchForward(sid, tailEnd, emit, signal, "rows", 0)) === null) return null;
-        return reached;
-      };
-      await fetchTail(sid, lastSeq, catchUp, dispatch, setHasMoreOlder, signal);
-    } else await fetchForward(sid, lastSeq.current, dispatch, signal);
+    try {
+      await replayFromCursor(sid, lastSeq, oldestSeq, dispatch, setHasMoreOlder, signal);
+    } catch (err) {
+      if (!(err instanceof LogRewound)) throw err;
+      signal.throwIfAborted();
+      dispatch({ kind: "reset" });
+      // The dial reads this ref before React commits the reset.
+      lastSeq.current = 0;
+      await fetchTail(sid, lastSeq, null, dispatch, setHasMoreOlder, signal);
+    }
   } catch {
     // Best effort.
   }
+}
+
+async function replayFromCursor(
+  sid: string,
+  lastSeq: { current: number },
+  oldestSeq: number,
+  dispatch: Dispatch,
+  setHasMoreOlder: (value: boolean) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  if (lastSeq.current === 0) await fetchTail(sid, lastSeq, null, dispatch, setHasMoreOlder, signal);
+  else if (oldestSeq === 0) {
+    // Cached control state is cursor-aware and must see each frame once, from its own cursor. Forward rows
+    // from that cursor would append older turns after the recovered tail, so rows resume exactly at the tail's end.
+    const from = lastSeq.current;
+    const catchUp: CatchUp = async (tailEnd, emit) => {
+      const reached = await fetchForward(sid, from, emit, signal, "frames");
+      if (reached === null || (await fetchForward(sid, tailEnd, emit, signal, "rows", 0)) === null) return null;
+      return reached;
+    };
+    await fetchTail(sid, lastSeq, catchUp, dispatch, setHasMoreOlder, signal);
+  } else await fetchForward(sid, lastSeq.current, dispatch, signal);
 }
 
 /** Runs after the tail loads and before it publishes. Null withholds the tail; else the seq the controls reached. */
@@ -87,6 +111,7 @@ async function fetchTail(
   if (!tailRes.ok) return;
   const tail = (await tailRes.json()) as ReplayPageResponse;
   signal.throwIfAborted();
+  if (lastSeq.current > 0 && tail.highest_seq < lastSeq.current) throw new LogRewound();
   if (tail.lost) {
     dispatch({ kind: "lagged", skipped: tail.highest_seq });
     return;
@@ -171,8 +196,7 @@ async function fetchForward(
     signal.throwIfAborted();
     if (target === null) {
       target = data.highest_seq;
-      // The server's log is behind our cursor (e.g. it was reset), so start over.
-      if (data.highest_seq < firstSince) dispatch({ kind: "reset" });
+      if (target < lastSeq) throw new LogRewound();
     }
     if (data.lost) {
       dispatch({ kind: "lagged", skipped: data.highest_seq });

@@ -528,6 +528,37 @@ describe("mid-turn cache recovery (#4530)", () => {
   });
 });
 
+describe("a persisted cursor ahead of a restarted log", () => {
+  it("drops the stale stopped banner and dials from the new log", async () => {
+    // The terminal handoff deleted the log; the new worker numbered its events from 1 again.
+    const stale = { ...emptyAcpState(), lastSeq: 19, workerStopped: true };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}sess-rewound`, JSON.stringify({ savedAt: Date.now(), state: stale }));
+    installAcpFakes(({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      const params = new URL(url, "http://x").searchParams;
+      const tail = params.has("before");
+      return json({
+        frames:
+          tail && params.get("view") !== "rows"
+            ? [{ session_id: "sess-rewound", seq: 12, event: "ThinkingStarted" }]
+            : [],
+        rows: params.get("view") === "rows" ? [] : null,
+        lost: false,
+        highest_seq: 12,
+        next_cursor: tail ? 1 : null,
+        has_more: false,
+      });
+    });
+    const { result } = render("sess-rewound");
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]!.url).toContain("/acp/ws?since=12");
+    expect(result.current.state).toMatchObject({ lastSeq: 12, workerStopped: false });
+    const persisted = JSON.parse(localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-rewound`)!) as { state: object };
+    expect(persisted.state).toMatchObject({ lastSeq: 12, workerStopped: false });
+  });
+});
+
 describe("recent-first cold open + loadOlder (#2236)", () => {
   const prompt = (seq: number) => ({ session_id: "sess-rf", seq, event: { UserPromptSent: { text: `p${seq}` } } });
   const page = (seqs: number[], next: number | null, hasMore: boolean) => {
