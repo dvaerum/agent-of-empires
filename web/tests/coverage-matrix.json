@@ -2006,8 +2006,9 @@
       "id": "directory-browser",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/session-create.spec.ts"],
-      "components": ["web/src/components/DirectoryBrowser.tsx"]
+      "specs": ["tests/live/session-create.spec.ts", "src/components/__tests__/DirectoryBrowser.test.tsx"],
+      "components": ["web/src/components/DirectoryBrowser.tsx"],
+      "notes": "The ~ button, breadcrumbs and parent link never request a folder above the home directory, which the server refuses with a 400."
     },
     {
       "id": "sidebar.groups",

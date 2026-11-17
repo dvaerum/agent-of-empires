@@ -63,7 +63,7 @@ describe("DirectoryBrowser", () => {
 
     await screen.findByRole("option", { name: /slow/i });
     fireEvent.click(screen.getByRole("option", { name: /slow/i }));
-    fireEvent.click(screen.getByRole("button", { name: "user" }));
+    fireEvent.click(screen.getByRole("button", { name: "~" }));
 
     await screen.findByRole("option", { name: /newer-child/i });
     expect(browseFilesystem).toHaveBeenNthCalledWith(2, "/home/user/slow", 100, undefined, false);
@@ -132,5 +132,64 @@ describe("DirectoryBrowser", () => {
       expect(browseFilesystem).toHaveBeenLastCalledWith("/home/user", 100, "proj", true);
     });
     await expect(screen.findByRole("option", { name: /\.hidden-proj/ })).resolves.toBeTruthy();
+  });
+});
+
+describe("DirectoryBrowser navigation above the home directory", () => {
+  // The server refuses any path outside the home directory with a 400, so no control may request one.
+  const requestedPaths = () => browseFilesystem.mock.calls.map((call) => call[0] as string);
+
+  async function openAt(path: string, home: string | null = "/home/user") {
+    getHomePath.mockResolvedValue(home);
+    browseFilesystem.mockImplementation(async (requested: string) => {
+      if (!requested.startsWith("/home/user")) return { entries: [], has_more: false, ok: false };
+      return response([dir("child", `${requested}/child`)]);
+    });
+    render(<DirectoryBrowser initialPath={path} onSelect={vi.fn()} />);
+    await screen.findByRole("option", { name: /child/i });
+    browseFilesystem.mockClear();
+  }
+
+  it("goes to the home directory from the ~ button, not to its first path segment", async () => {
+    await openAt("/home/user/a/b");
+
+    fireEvent.click(screen.getByRole("button", { name: "~" }));
+
+    await waitFor(() => expect(requestedPaths()).toEqual(["/home/user"]));
+  });
+
+  it("lists only the folders below home as breadcrumbs, each navigating inside home", async () => {
+    await openAt("/home/user/a/b");
+
+    expect(screen.queryByRole("button", { name: "home" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "user" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "a" }));
+
+    await waitFor(() => expect(requestedPaths()).toEqual(["/home/user/a"]));
+  });
+
+  it("keeps the first folder below home reachable when the breadcrumb is truncated", async () => {
+    await openAt("/home/user/a/b/c/d");
+
+    fireEvent.click(screen.getByRole("button", { name: "a" }));
+
+    await waitFor(() => expect(requestedPaths()).toEqual(["/home/user/a"]));
+  });
+
+  it("offers a parent link below home but none at home itself", async () => {
+    await openAt("/home/user/a");
+    fireEvent.click(screen.getByRole("option", { name: /parent directory/i }));
+    await waitFor(() => expect(requestedPaths()).toEqual(["/home/user"]));
+    await screen.findByRole("option", { name: /child/i });
+
+    expect(screen.queryByRole("option", { name: /parent directory/i })).toBeNull();
+  });
+
+  it("shows the whole path when the home directory is unknown", async () => {
+    await openAt("/home/user/a", null);
+
+    expect(screen.getByRole("button", { name: "home" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "user" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: /parent directory/i })).toBeTruthy();
   });
 });

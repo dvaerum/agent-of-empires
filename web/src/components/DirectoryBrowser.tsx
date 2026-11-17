@@ -21,6 +21,8 @@ export function DirectoryBrowser({ initialPath, onSelect, inputRef }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [showHidden, setShowHidden] = useState(false);
+  // The server only browses inside the home directory, so ancestors of it are never requested.
+  const [home, setHome] = useState<string | null>(null);
   const initialized = useRef(false);
   const loadSeq = useRef(0);
   const loadedFilter = useRef("");
@@ -115,15 +117,25 @@ export function DirectoryBrowser({ initialPath, onSelect, inputRef }: Props) {
     initialized.current = true;
 
     queueMicrotask(async () => {
+      const homeLookup = (async () => {
+        const path = await getHomePath();
+        setHome(path || null);
+        return path;
+      })();
       if (initialPath && (await navigate(initialPath))) return;
       const lastDir = safeGetItem(LAST_DIR_KEY);
       if (lastDir && (await navigate(lastDir))) return;
-      const home = await getHomePath();
-      await navigate(home || "/");
+      await navigate((await homeLookup) || "/");
     });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const pathSegments = currentPath.split("/").filter(Boolean);
+  const homeSegments = home ? home.split("/").filter(Boolean) : [];
+  const insideHome = homeSegments.length > 0 && homeSegments.every((seg, i) => pathSegments[i] === seg);
+  // Segments of `pathSegments` before this index are home or its ancestors, which the breadcrumb leaves to `~`.
+  const firstCrumb = insideHome ? homeSegments.length : 0;
+  const shownSegments = pathSegments.slice(firstCrumb);
+  const hasParent = pathSegments.length > Math.max(firstCrumb, 1);
 
   const goUp = () => {
     const parent = currentPath.split("/").slice(0, -1).join("/") || "/";
@@ -149,12 +161,12 @@ export function DirectoryBrowser({ initialPath, onSelect, inputRef }: Props) {
 
   // Breadcrumb truncation for mobile: show first + "..." + last 2
   const renderBreadcrumbs = () => {
-    if (pathSegments.length <= 3) {
-      return pathSegments.map((seg, i) => (
+    if (shownSegments.length <= 3) {
+      return shownSegments.map((seg, i) => (
         <span key={i} className="flex items-center">
           <span className="text-text-dim mx-1">/</span>
           <button
-            onClick={() => goToSegment(i)}
+            onClick={() => goToSegment(firstCrumb + i)}
             className="text-text-secondary hover:text-text-primary cursor-pointer text-sm truncate max-w-[120px]"
           >
             {seg}
@@ -167,14 +179,14 @@ export function DirectoryBrowser({ initialPath, onSelect, inputRef }: Props) {
         <span className="flex items-center">
           <span className="text-text-dim mx-1">/</span>
           <button
-            onClick={() => goToSegment(0)}
+            onClick={() => goToSegment(firstCrumb)}
             className="text-text-secondary hover:text-text-primary cursor-pointer text-sm"
           >
-            {pathSegments[0]}
+            {shownSegments[0]}
           </button>
         </span>
         <span className="text-text-dim mx-1">/...</span>
-        {pathSegments.slice(-2).map((seg, i) => (
+        {shownSegments.slice(-2).map((seg, i) => (
           <span key={i} className="flex items-center">
             <span className="text-text-dim mx-1">/</span>
             <button
@@ -194,7 +206,7 @@ export function DirectoryBrowser({ initialPath, onSelect, inputRef }: Props) {
       {/* Breadcrumbs */}
       <nav aria-label="Directory path" className="flex items-center flex-wrap gap-0.5 mb-3 min-h-[28px]">
         <button
-          onClick={() => navigate(currentPath.split("/").slice(0, 2).join("/") || "/")}
+          onClick={() => navigate(home || currentPath.split("/").slice(0, 2).join("/") || "/")}
           className="text-text-dim hover:text-text-secondary cursor-pointer text-sm"
           title="Go to home"
         >
@@ -254,7 +266,7 @@ export function DirectoryBrowser({ initialPath, onSelect, inputRef }: Props) {
         ) : (
           <>
             {/* Parent directory link */}
-            {pathSegments.length > 1 && (
+            {hasParent && (
               <button
                 onClick={goUp}
                 className="flex items-center w-full px-3 h-[44px] text-left hover:bg-surface-700/50 cursor-pointer transition-colors border-b border-surface-800 text-text-dim"
