@@ -359,6 +359,23 @@ pub(crate) fn unset_claude_auth_routes() -> EnvGuard {
     EnvGuard::unset(crate::session::sandbox_login::claude::OTHER_AUTH_ROUTES)
 }
 
+/// A Claude config dir under `dir` that holds `sid`'s transcript for `project`
+/// (or nothing). Point `CLAUDE_CONFIG_DIR` at the returned path.
+pub(crate) fn claude_store_holding(dir: &Path, project: &str, sid: Option<&str>) -> PathBuf {
+    if let Some(sid) = sid {
+        // The probe resolves the project path before encoding it.
+        let project = std::fs::canonicalize(project).unwrap();
+        let transcripts =
+            dir.join("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &project.to_string_lossy(),
+                ));
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(transcripts.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+    }
+    dir.to_path_buf()
+}
+
 pub(crate) fn isolate_app_dir() -> AppDirGuard {
     // Private Unix sockets must fit Darwin's sockaddr_un even when TMPDIR is long.
     let temp_home = TempDir::new_in("/tmp").expect("create tempdir for AppDirGuard");

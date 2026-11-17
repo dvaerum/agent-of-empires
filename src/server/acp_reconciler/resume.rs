@@ -451,7 +451,6 @@ async fn build_spawn_request(
     // before ensure_container, which takes the same lock.
     let (
         cwd,
-        seed_history_replay,
         fork_from,
         acp_mode_id,
         acp_effort,
@@ -460,7 +459,6 @@ async fn build_spawn_request(
         agent_provider,
         claude_store_pin,
         instance,
-        prior_conversation,
     ) = {
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -475,7 +473,6 @@ async fn build_spawn_request(
         }
         (
             PathBuf::from(&inst.project_path),
-            inst.import_pending == Some(true),
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
@@ -484,8 +481,6 @@ async fn build_spawn_request(
             inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
             inst.clone(),
-            target.stored_acp_session_id.is_none()
-                && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
         )
     };
     let config_path = instance.repo_config_path().to_path_buf();
@@ -497,6 +492,15 @@ async fn build_spawn_request(
             &config_path,
         )
         .await;
+    // The row, not the tick's snapshot, decides what the worker resumes, and
+    // by the enable path's own rule: a switch from terminal leaves the
+    // conversation in `agent_session_id` until the first worker records its
+    // id, and a worker that wins the race against the switch's own launch
+    // must not start a fresh session over it.
+    let seed =
+        crate::server::api::structured_seed_for(&instance, &agent, None, claude_store_pin.as_ref());
+    let prior_conversation = instance.acp_session_id.is_none()
+        && (instance.agent_session_id.is_some() || instance.pi_session_path.is_some());
     let (native, exclusion) = crate::server::session_store::NativeSessionStore::open_for_launch(
         state.clone(),
         &instance,
@@ -557,15 +561,19 @@ async fn build_spawn_request(
         effort_explicit: acp_effort.is_some(),
         effort: acp_effort,
         model_config: acp_model_config,
-        stored_acp_session_id: target.stored_acp_session_id.clone(),
+        stored_acp_session_id: seed.stored_acp_session_id,
         fork_from,
-        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
+        sandbox_continuation: if seed.import_terminal {
+            crate::acp::supervisor::SandboxContinuation::ImportTerminal
+        } else {
+            crate::acp::supervisor::SandboxContinuation::Persisted
+        },
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
-        seed_history_replay,
+        seed_history_replay: seed.seed_history_replay,
         prior_conversation,
         claude_store_pin,
     })
@@ -1297,5 +1305,163 @@ mod tests {
             .unwrap();
         assert_eq!(store.holds_live_work(id), Some(false));
         state.acp_supervisor.detach_all().await;
+    }
+
+    /// A structured claude row as a keep-context terminal handoff leaves it:
+    /// the conversation id lives only in `agent_session_id`.
+    fn handed_back_claude_row(id: &str, project: &str, sid: &str) -> Instance {
+        let mut row = structured_instance(id, project);
+        row.tool = "claude".into();
+        row.agent_name = Some("claude".into());
+        row.agent_session_id = Some(sid.into());
+        row
+    }
+
+    /// Seeds `row` on disk and in a fresh app state whose launcher reports the
+    /// stored id of every launch it is asked to make, then refuses it.
+    async fn state_reporting_launch_seeds(
+        row: Instance,
+    ) -> (
+        Arc<AppState>,
+        tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+    ) {
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let (tx, seeds) = tokio::sync::mpsc::unbounded_channel();
+        let launcher: crate::acp::supervisor::Launcher = Arc::new(move |config, _id| {
+            let _ = tx.send(config.stored_acp_session_id);
+            Box::pin(async {
+                Err(crate::acp::acp_client::AcpError::Spawn(
+                    "test launcher".into(),
+                ))
+            })
+        });
+        let state =
+            crate::server::test_support::build_test_app_state_with_launcher(vec![row], launcher);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        (state, seeds)
+    }
+
+    async fn the_seed_of_the_next_launch(
+        seeds: &mut tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+    ) -> Option<String> {
+        timeout(Duration::from_secs(10), seeds.recv())
+            .await
+            .expect("a worker launch was attempted")
+            .expect("launcher alive")
+    }
+
+    /// The resume paths (reconciler tick, prompt wake) must seed exactly like
+    /// the enable path: a row with no `acp_session_id` whose conversation sits
+    /// in `agent_session_id` resumes that conversation instead of `session/new`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_resume_request_seeds_from_agent_session_id_when_the_acp_id_is_unset() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().to_str().unwrap();
+        // (acp id on the row, host store holds the transcript, expected stored
+        // id, expect the terminal-import lane)
+        let cases = [
+            (None, true, Some("ses_kept"), true),
+            // Transcript confirmed absent: a fresh session, never a failing load.
+            (None, false, None, false),
+            // An existing acp id always wins and is not an import.
+            (Some("ses_acp"), true, Some("ses_acp"), false),
+        ];
+        for (acp, present, expected, import) in cases {
+            let store = tempfile::tempdir().unwrap();
+            let config_dir = crate::session::test_support::claude_store_holding(
+                store.path(),
+                path,
+                present.then_some("ses_kept"),
+            );
+            let _env =
+                crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &config_dir)]);
+            let mut row = handed_back_claude_row("s-seed", path, "ses_kept");
+            row.acp_session_id = acp.map(Into::into);
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+
+            let req = build_spawn_request(
+                &state.session_service,
+                &ResumeTarget::from_instance(&row),
+                LaunchOrigin::Unattended,
+            )
+            .await
+            .unwrap();
+
+            let case = format!("acp={acp:?} present={present}");
+            assert_eq!(req.stored_acp_session_id.as_deref(), expected, "{case}");
+            assert_eq!(
+                req.sandbox_continuation
+                    == crate::acp::supervisor::SandboxContinuation::ImportTerminal,
+                import,
+                "{case}"
+            );
+            assert_eq!(req.seed_history_replay, import, "{case}");
+            assert!(req.prior_conversation || acp.is_some(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prompt_wake_resume_loads_the_conversation_kept_in_agent_session_id() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().to_str().unwrap();
+        let config_dir = crate::session::test_support::claude_store_holding(
+            store.path(),
+            path,
+            Some("ses_kept"),
+        );
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &config_dir)]);
+        let row = handed_back_claude_row("s-wake", path, "ses_kept");
+        let (state, mut seeds) = state_reporting_launch_seeds(row).await;
+
+        let trigger = trigger_resume_background(
+            &state.session_service,
+            "s-wake",
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+            LaunchOrigin::Unattended,
+        )
+        .await
+        .expect("resume is admitted");
+        assert!(matches!(trigger, ResumeTrigger::Started));
+
+        assert_eq!(
+            the_seed_of_the_next_launch(&mut seeds).await.as_deref(),
+            Some("ses_kept")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconciler_resume_loads_the_conversation_kept_in_agent_session_id() {
+        use super::super::test_fixtures::Tick;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().to_str().unwrap();
+        let config_dir = crate::session::test_support::claude_store_holding(
+            store.path(),
+            path,
+            Some("ses_kept"),
+        );
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &config_dir)]);
+        let row = handed_back_claude_row("s-tick", path, "ses_kept");
+        let (state, mut seeds) = state_reporting_launch_seeds(row).await;
+
+        Tick::default().run(&state).await;
+
+        assert_eq!(
+            the_seed_of_the_next_launch(&mut seeds).await.as_deref(),
+            Some("ses_kept")
+        );
     }
 }
