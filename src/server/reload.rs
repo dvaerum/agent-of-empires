@@ -3882,8 +3882,14 @@ mod tests {
                 fresh.status = status;
                 cache.alias_only_instances = vec![fresh];
                 apply_supplementary_tick(&mut cache, &prior, metadata);
-                assert_eq!(cache.alias_only_instances[0].status, status);
-                assert_eq!(cache.alias_only_instances[0].idle_entered_at, None);
+                if status == Status::Stopped && metadata.is_some() {
+                    // A Stopped row whose agent pane is alive was never really stopped, so it is
+                    // re-probed like any live row.
+                    assert_eq!(cache.alias_only_instances[0].status, Status::Idle);
+                } else {
+                    assert_eq!(cache.alias_only_instances[0].status, status);
+                    assert_eq!(cache.alias_only_instances[0].idle_entered_at, None);
+                }
             }
         }
         let mut fresh = stored.clone();
