@@ -419,7 +419,22 @@ pub enum KeyToken<'a> {
 pub struct PermissionResponse<'a> {
     pub allow: &'a [KeyToken<'a>],
     pub allow_always: Option<&'a [KeyToken<'a>]>,
+    /// Keys to send after `allow_always` only if the pane then shows a confirmation step.
+    pub allow_always_followup: Option<PermissionFollowUp<'a>>,
     pub deny: &'a [KeyToken<'a>],
+    /// The dialog's highlighted option is not fixed, so Allow and Allow-always
+    /// first read the highlight from the pane and move it to the target before
+    /// `allow`/`allow_always` confirm it, and Deny's follow-ups are decided
+    /// from the pane too.
+    pub pane_guided: bool,
+}
+
+/// A second keystroke sequence that one generation of an agent's dialog needs and another does not.
+#[derive(Clone, Copy, Debug)]
+pub struct PermissionFollowUp<'a> {
+    /// Text the confirmation step draws, absent once the decision has been applied.
+    pub when_pane_contains: &'a str,
+    pub tokens: &'a [KeyToken<'a>],
 }
 
 const fn hook(name: &'static str, status: HookStatus) -> HookEvent {
@@ -658,7 +673,9 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Literal("1")],
             allow_always: Some(&[KeyToken::Literal("2")]),
+            allow_always_followup: None,
             deny: &[KeyToken::Literal("3")],
+            pane_guided: false,
         }),
         ..agent(
             "claude",
@@ -693,16 +710,16 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         ready_marker: Some("ask anything"),
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
-            allow_always: Some(&[
-                KeyToken::Named("Right"),
-                KeyToken::Named("Enter"),
-                KeyToken::Named("Enter"),
-            ]),
-            deny: &[
-                KeyToken::Named("Right"),
-                KeyToken::Named("Right"),
-                KeyToken::Named("Enter"),
-            ],
+            // Enter confirms the highlighted option; the flow first moves the highlight
+            // there. 2.x applies the grant on this Enter; 1.x then asks to confirm.
+            allow_always: Some(&[KeyToken::Named("Enter")]),
+            allow_always_followup: Some(PermissionFollowUp {
+                when_pane_contains: "\u{25B3} Always allow",
+                tokens: &[KeyToken::Named("Enter")],
+            }),
+            // Escape rejects whichever option is highlighted.
+            deny: &[KeyToken::Named("Escape")],
+            pane_guided: true,
         }),
         ..agent(
             "opencode",
@@ -745,7 +762,9 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Literal("y")],
             allow_always: Some(&[KeyToken::Literal("a")]),
+            allow_always_followup: None,
             deny: &[KeyToken::Literal("d")],
+            pane_guided: false,
         }),
         ..agent("codex", "codex", "npm install -g @openai/codex")
     },

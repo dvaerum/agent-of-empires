@@ -138,7 +138,9 @@ impl<'a> DefinitionData<'a> {
             permission_response: entry.reply_fallback.as_ref().map(|_| PermissionResponse {
                 allow: &self.allow,
                 allow_always: self.always.as_deref(),
+                allow_always_followup: None,
                 deny: &self.deny,
+                pane_guided: false,
             }),
             lifecycle: AgentLifecycle::Active,
         })
