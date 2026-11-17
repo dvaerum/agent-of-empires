@@ -723,6 +723,16 @@ pub(super) mod tests {
             .set_str("core.hooksPath", hook.parent().unwrap().to_str().unwrap())
             .unwrap();
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        // A host-global core.hooksPath (common with managed git setups) would
+        // otherwise bypass the repo's own hooks directory.
+        run_git(
+            dir.path(),
+            &[
+                "config",
+                "core.hooksPath",
+                hook.parent().unwrap().to_str().unwrap(),
+            ],
+        );
         std::fs::write(
             &hook,
             "#!/bin/sh\necho 'simulated hook failure' >&2\nexit 1\n",

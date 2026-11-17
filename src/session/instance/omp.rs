@@ -824,6 +824,19 @@ mod tests {
         exercise_omp_wrapper(None);
     }
 
+    /// `/usr/bin:/bin` plus the directory of the hash tool the wrapper needs:
+    /// hosts such as NixOS keep `sha256sum` out of `/usr/bin`.
+    #[cfg(unix)]
+    fn wrapper_tool_path() -> String {
+        let mut path = String::from("/usr/bin:/bin");
+        let hasher = which::which("sha256sum").or_else(|_| which::which("shasum"));
+        if let Some(dir) = hasher.ok().as_deref().and_then(std::path::Path::parent) {
+            path.push(':');
+            path.push_str(&dir.to_string_lossy());
+        }
+        path
+    }
+
     /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux` wins over any real
     /// one.
     #[cfg(unix)]
@@ -869,7 +882,7 @@ mod tests {
             ])
             .env_clear()
             .env("HOME", home.path())
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", wrapper_tool_path())
             .env("breadcrumb_tmp", "preexisting")
             .env("marker_tmp", "preexisting")
             .env("write_count", "1")

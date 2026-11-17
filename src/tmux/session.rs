@@ -5177,7 +5177,7 @@ mod tests {
                 "-P",
                 "-F",
                 "#{pane_id}",
-                "/bin/bash --noprofile --norc -c 'read -r line'",
+                "bash --noprofile --norc -c 'read -r line'",
             ])
             .output()
             .expect("tmux split-window");
@@ -5921,7 +5921,7 @@ mod tests {
             crate::session::environment::shell_escape(&output.to_string_lossy())
         );
         let command = format!(
-            "exec /bin/bash --noprofile --norc -c {}",
+            "exec bash --noprofile --norc -c {}",
             crate::session::environment::shell_escape(&script)
         );
 
@@ -6040,7 +6040,7 @@ mod tests {
                 "80",
                 "-y",
                 "24",
-                "/bin/bash --noprofile --norc",
+                "bash --noprofile --norc",
             ])
             .output()
             .expect("tmux new-session");

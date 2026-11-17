@@ -3855,11 +3855,7 @@ mod tests {
             home.path().join("bin/direct-agent"),
             login_bin.join("login-agent"),
         ] {
-            std::fs::write(
-                &path,
-                format!("#!/bin/sh\n/bin/touch {}\n", executed.display()),
-            )
-            .unwrap();
+            std::fs::write(&path, format!("#!/bin/sh\ntouch {}\n", executed.display())).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let probe_path = home.path().join("probes");
@@ -3873,7 +3869,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let injected = format!("login-agent \"$(/bin/touch {})\"", executed.display());
+        let injected = format!("login-agent \"$(touch {})\"", executed.display());
         let cases = [
             ("direct-agent", true),
             ("TOKEN=local direct-agent", true),
@@ -4294,6 +4290,10 @@ mod tests {
                 let _ = std::fs::write(&self.0, "release");
             }
         }
+        // The probe environment's PATH holds only the fake bin dir, and NixOS has no /bin/sleep
+        // or /bin/ps, so resolve them while the real PATH is still in effect.
+        let sleep = which::which("sleep").unwrap();
+        let ps = which::which("ps").unwrap();
         for (executable, timeout) in [
             ("vibe", AGENT_PROBE_TIMEOUT / 5),
             ("login-shell", LOGIN_SHELL_PROBE_TIMEOUT / 5),
@@ -4305,8 +4305,9 @@ mod tests {
             let release = home.path().join("release");
             let ready = home.path().join("ready");
             let wait = format!(
-                "while [ ! -e {} ]; do /bin/sleep 0.02; done",
-                shell_words::quote(release.to_str().unwrap())
+                "while [ ! -e {} ]; do {} 0.02; done",
+                shell_words::quote(release.to_str().unwrap()),
+                shell_words::quote(sleep.to_str().unwrap())
             );
             let script = format!(
                 "#!/bin/sh\n/bin/sh -c {} &\nchild=$!\ntrap 'kill \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; exit 1' TERM\nprintf '%s %s\\n' \"$$\" \"$child\" > {}\nwait \"$child\"\nexit 1\n",
@@ -4360,7 +4361,7 @@ mod tests {
                     .split_whitespace()
                     .enumerate()
                 {
-                    let output = Command::new("/bin/ps")
+                    let output = Command::new(&ps)
                         .args(["-o", "stat=", "-p", pid])
                         .output()
                         .unwrap();
@@ -4719,7 +4720,7 @@ mod tests {
         reader
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut command = Command::new("/bin/sleep");
+        let mut command = Command::new("sleep");
         command.arg("30");
         // pre_exec runs before spawn returns, so even a descheduled exec has an identity.
         unsafe {
@@ -5971,14 +5972,14 @@ mod tests {
         }
         // Scaled timeouts: the login shell outlives the per-agent timeout but not its own.
         PROBE_TIMEOUT_DIVISOR.set(5).unwrap();
+        let sleep = which::which("sleep").unwrap();
+        let sleep = shell_words::quote(sleep.to_str().unwrap()).into_owned();
         let home = tempfile::tempdir().unwrap();
         let _env = probe_environment(home.path());
         let log = shell_words::quote(home.path().join("probes").to_str().unwrap()).into_owned();
         std::fs::write(
             home.path().join("bin/login-shell"),
-            format!(
-                "#!/bin/sh\nprintf 'login\n' >> {log}\n/bin/sleep 1.2\nexec /bin/sh -c \"$2\"\n"
-            ),
+            format!("#!/bin/sh\nprintf 'login\n' >> {log}\n{sleep} 1.2\nexec /bin/sh -c \"$2\"\n"),
         )
         .unwrap();
         let found = login_shell_probe(

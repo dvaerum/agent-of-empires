@@ -1304,7 +1304,7 @@ mod tests {
         .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
         let ready = root.path().join("direct-agent-ready");
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec /bin/sleep 60\n",
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
             crate::session::environment::shell_escape(ready.to_str().unwrap())
         );
         let _agent = crate::session::test_support::install_login_shell_path_command(
@@ -1350,7 +1350,7 @@ mod tests {
                 "-d",
                 "-s",
                 &name,
-                "exec /bin/sleep 60",
+                "exec sleep 60",
             ])
             .output()
             .unwrap()

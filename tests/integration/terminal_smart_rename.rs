@@ -106,7 +106,7 @@ fn create_pane(name: &str, typed: &str) {
             name,
             "/bin/sh",
             "-c",
-            r#"printf '%s\n' "$1"; exec /bin/cat"#,
+            r#"printf '%s\n' "$1"; exec cat"#,
             "sh",
             typed,
         ])

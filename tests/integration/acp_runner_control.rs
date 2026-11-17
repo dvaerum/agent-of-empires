@@ -149,7 +149,7 @@ fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
 /// daemon's `ServerResult` reaches the agent as a JSON-RPC response echoing
 /// the agent's own id.
 ///
-/// The stand-in agent is `/bin/cat`, so whatever the runner writes to its
+/// The stand-in agent is `cat`, so whatever the runner writes to its
 /// stdin comes back on its stdout. That is enough to drive both directions:
 /// the test writes an agent-to-client request into the runner (by having the
 /// runner send it to cat), and reads back the response the runner wrote.
@@ -171,6 +171,8 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
+    // NixOS has no /bin/cat, so resolve the absolute path from the host PATH.
+    let cat = which::which("cat").expect("cat on PATH");
     let bin = env!("CARGO_BIN_EXE_aoe");
     let mut child: Child = Command::new(bin)
         .args([
@@ -187,7 +189,7 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
             // Absolute path: relying on the runner's inherited PATH makes a
             // non-standard PATH (e.g. nix-first) surface as a confusing
             // "registry record never appeared" instead of a clear failure.
-            "/bin/cat",
+            cat.to_str().unwrap(),
         ])
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)

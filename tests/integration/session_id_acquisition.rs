@@ -379,7 +379,7 @@ sleep 60
             .args(args)
             .current_dir(&project)
             .env("PATH", &path)
-            .env("SHELL", "/bin/bash")
+            .env("SHELL", which::which("bash").expect("bash on PATH"))
             .env("TMPDIR", temp.path())
             .env("AOE_TMUX_SOCKET", tmux_socket())
             .env_remove("AOE_DAEMON_URL")

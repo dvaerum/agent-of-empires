@@ -984,7 +984,7 @@ mod tests {
         let _env = isolate_resume_environment(temp.path());
         let ready = temp.path().join("agent-ready");
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec /bin/sleep 60\n",
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
             shell_escape(ready.to_str().unwrap())
         );
         let _agent = install_fake_claude(temp.path(), &script);
@@ -2147,7 +2147,7 @@ mod tests {
             let _agent = crate::session::test_support::install_login_shell_path_command(
                 temp.path(),
                 tool,
-                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec /bin/sleep 60\n",
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n",
             );
             let project = temp.path().join(tool);
             std::fs::create_dir(&project).unwrap();
@@ -2229,7 +2229,7 @@ mod tests {
         inst.source_profile = "fb-loop-break".to_string();
         let ready = temp.path().join("fresh-agent-ready");
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\ncase \"$*\" in *{stale_sid}*) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec /bin/sleep 60\n",
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\ncase \"$*\" in *{stale_sid}*) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
             shell_escape(ready.to_str().unwrap())
         );
         let _fake_claude = install_fake_claude(temp.path(), &script);
