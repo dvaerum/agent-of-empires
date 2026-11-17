@@ -172,6 +172,33 @@ const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// restart path's latency, not in agent responsiveness afterward.
 const RESUME_PROBE_POST_SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
 
+/// What a launch-level rejection prints, as opposed to a failure inside a conversation.
+const LAUNCH_REJECTION_MARKERS: [&str; 9] = [
+    "unknown option",
+    "unknown argument",
+    "unrecognized option",
+    "unrecognized argument",
+    "unexpected argument",
+    "invalid option",
+    "bad option",
+    "usage:",
+    "command not found",
+];
+
+/// Whether the agent's own last line (a `dead_pane_detail` suffix) shows the pane died because
+/// the launch itself was rejected, such as an unsupported extra argument, and not over the stored
+/// conversation. Anything else, including an empty line, stays a resume failure.
+fn pane_death_is_unrelated_to_resume(detail: &str, sid: &str) -> bool {
+    let line = detail.to_lowercase();
+    LAUNCH_REJECTION_MARKERS
+        .iter()
+        .any(|marker| line.contains(marker))
+        && !line.contains(&sid.to_lowercase())
+        && !["session", "conversation", "resume", "transcript"]
+            .iter()
+            .any(|word| line.contains(word))
+}
+
 impl Instance {
     pub fn restart_with_size(&mut self, size: Option<(u16, u16)>) -> Result<StartOutcome> {
         self.restart_with_size_opts(size, false)
@@ -302,6 +329,8 @@ impl Instance {
     ///      `resume_probe_failed_sid` loop-breaker, and return
     ///      `StartOutcome::ResumeFailed`. A dead pane is not proof that the
     ///      sid is invalid, so this path must not clear it or launch fresh.
+    ///      When the agent's last line is about something else, the launch
+    ///      fails with that line and no loop-breaker is armed.
     ///   3. A launch that pins an already-stored id without resuming it
     ///      (`--session-id <sid>`, or a fork's pre-generated child id) is
     ///      probed the same way, but a death there fails the call outright
@@ -817,6 +846,12 @@ impl Instance {
             self.id,
         );
         self.capture_poller.clear();
+        let detail = self.dead_pane_detail();
+        if pane_death_is_unrelated_to_resume(&detail, &stale_sid) {
+            // Nothing was learned about the stored id, so arm no failure; the launch fails with
+            // the agent's own line instead.
+            anyhow::bail!("agent exited immediately{detail}");
+        }
         self.resume_probe_failed_sid = Some(stale_sid.clone());
         self.mark_resume_probe_failed(storage, &stale_sid)?;
         let killed = self.kill_clean_locked();
@@ -826,8 +861,7 @@ impl Instance {
         killed.with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
         self.status = Status::Error;
         self.last_error = Some(format!(
-            "resume failed for sid {}; preserved for explicit retry",
-            stale_sid
+            "resume failed for sid {stale_sid}{detail}; preserved for explicit retry"
         ));
         self.last_error_check = Some(std::time::Instant::now());
         Ok(StartOutcome::ResumeFailed { sid: stale_sid })
@@ -1855,6 +1889,109 @@ mod tests {
             let row = loaded.iter().find(|i| i.id == inst.id).expect("instance");
             assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
             assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));
+        }
+    }
+
+    #[test]
+    fn only_a_rejected_launch_is_unrelated_to_the_stored_conversation() {
+        const SID: &str = "11111111-1111-1111-1111-111111111111";
+        for (detail, unrelated) in [
+            (": error: unknown option '--bogus'", true),
+            (": Unknown argument: bogus", true),
+            (": error: unexpected argument '--bogus' found", true),
+            (": main.py: error: unrecognized arguments: --bogus", true),
+            ("", false),
+            (": ^C", false),
+            (": TypeError: x is not a function", false),
+            (": No conversation found with session ID", false),
+            (": error: unknown option '--resume'", false),
+            (
+                ": usage: could not load 11111111-1111-1111-1111-111111111111",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                pane_death_is_unrelated_to_resume(detail, SID),
+                unrelated,
+                "{detail:?}"
+            );
+        }
+    }
+
+    /// A pane that dies inside the probe says why. A rejected launch (a bad extra argument) says
+    /// nothing was wrong with the stored id, so no failure is armed and the launch fails with that
+    /// line; any other death stays a resume failure that carries the line.
+    #[test]
+    #[serial]
+    fn probe_death_reports_the_agents_own_line_and_arms_only_a_resume_failure() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("tmux not available; skipping");
+            return;
+        }
+        const SID: &str = "11111111-1111-1111-1111-111111111111";
+        for (script, line, resume_failure) in [
+            (
+                "#!/bin/sh\necho \"error: unknown option '--bogus'\" >&2\nexit 2\n",
+                "error: unknown option '--bogus'",
+                false,
+            ),
+            (
+                "#!/bin/sh\necho 'No conversation found with session ID' >&2\nexit 1\n",
+                "No conversation found with session ID",
+                true,
+            ),
+        ] {
+            let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let _env = isolate_resume_environment(temp.path());
+            let storage = crate::session::storage::Storage::new_unwatched("probe-line").unwrap();
+            let mut inst = Instance::new("probe_line", project_dir.to_str().unwrap());
+            inst.tool = "claude".to_string();
+            inst.source_profile = "probe-line".to_string();
+            let _fake_claude = install_fake_claude(temp.path(), script);
+            inst.command = "claude".to_string();
+            inst.agent_session_id = Some(SID.to_string());
+            inst.status = Status::Idle;
+            seed_claude_transcript(&mut inst, SID);
+            let rows = vec![inst.clone()];
+            storage
+                .update(|i, g| {
+                    *i = rows.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&rows, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name);
+
+            let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
+
+            let stored = storage.load().unwrap();
+            let row = stored.iter().find(|row| row.id == inst.id).expect("row");
+            assert_eq!(row.agent_session_id.as_deref(), Some(SID), "{line}");
+            assert_eq!(inst.status, Status::Error, "{line}");
+            let last_error = inst.last_error.clone().unwrap_or_default();
+            assert!(last_error.contains(line), "{line}: {last_error:?}");
+            if resume_failure {
+                assert_eq!(
+                    outcome.unwrap(),
+                    StartOutcome::ResumeFailed { sid: SID.into() }
+                );
+                assert!(last_error.contains("preserved for explicit retry"));
+                assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(SID));
+            } else {
+                let error = outcome.expect_err("an unrelated crash fails the launch");
+                assert!(format!("{error:#}").contains(line), "{error:#}");
+                assert!(!last_error.contains("resume failed"), "{last_error:?}");
+                assert_eq!(inst.resume_probe_failed_sid, None);
+                assert_eq!(row.resume_probe_failed_sid, None);
+                // The retry reports the same real error instead of a resume failure.
+                let again = inst
+                    .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+                    .expect_err("the retry hits the same crash");
+                assert!(format!("{again:#}").contains(line), "{again:#}");
+            }
         }
     }
 
