@@ -992,6 +992,19 @@ impl Drop for CaptureCycleWitness {
     }
 }
 
+/// A capture that errors means tmux can no longer answer for this session (a stop, a kill, a
+/// restart): close the socket so the page redials, instead of leaving it open and silent. 1013 is
+/// retryable; 4001 stays reserved for a pane that still exists but is dead.
+async fn close_tmux_gone(tx: &tokio::sync::mpsc::Sender<Message>) {
+    // A failed send means the sender task already ended, so the socket is closing anyway.
+    let _ = tx
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: CLOSE_CODE_TRY_AGAIN_LATER,
+            reason: "tmux_gone".into(),
+        })))
+        .await;
+}
+
 async fn handle_live_ws_inner(
     mut socket: WebSocket,
     tmux_name: String,
@@ -1215,7 +1228,10 @@ async fn handle_live_ws_inner(
                                 grid_incomplete = sample.incomplete;
                                 CaptureOutcome::Frame(sample.content, sample.cursor)
                             }
-                            Err(_) => break,
+                            Err(_) => {
+                                close_tmux_gone(&capture_tx).await;
+                                break;
+                            }
                         }
                     }
                     _ => {
@@ -1233,7 +1249,10 @@ async fn handle_live_ws_inner(
                                 CaptureOutcome::Frame(content, cursor)
                             }
                             Ok(Ok(_)) => CaptureOutcome::Dead,
-                            _ => break,
+                            _ => {
+                                close_tmux_gone(&capture_tx).await;
+                                break;
+                            }
                         }
                     }
                 };
@@ -1254,7 +1273,10 @@ async fn handle_live_ws_inner(
                         CaptureOutcome::Frame(content, cursor)
                     }
                     Ok(Ok(_)) => CaptureOutcome::Dead,
-                    _ => break,
+                    _ => {
+                        close_tmux_gone(&capture_tx).await;
+                        break;
+                    }
                 };
             }
 
@@ -3045,5 +3067,246 @@ mod tests {
             Some(1),
             crate::tmux::vt::SCROLLBACK_LINES + 1
         ));
+    }
+
+    /// A live-ws route around `handle_live_ws_inner`; every finished handler reports on
+    /// `closed_rx`, so a test can tell the server side ended without the client leaving.
+    #[cfg(unix)]
+    struct LiveTestServer {
+        address: std::net::SocketAddr,
+        shutdown: tokio_util::sync::CancellationToken,
+        server: tokio::task::JoinHandle<()>,
+        closed_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    }
+
+    #[cfg(unix)]
+    impl LiveTestServer {
+        async fn start(tmux_name: &str, transport: LiveTransport) -> Self {
+            let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let route_shutdown = shutdown.clone();
+            let name = tmux_name.to_string();
+            let router = axum::Router::new().route(
+                "/live",
+                axum::routing::get(move |ws: WebSocketUpgrade| {
+                    let name = name.clone();
+                    let shutdown = route_shutdown.clone();
+                    let closed_tx = closed_tx.clone();
+                    async move {
+                        ws.on_upgrade(move |socket| async move {
+                            handle_live_ws_inner(socket, name, true, shutdown, transport, 0, false)
+                                .await;
+                            let _ = closed_tx.send(());
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_shutdown = shutdown.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                    .await
+                    .unwrap();
+            });
+            Self {
+                address,
+                shutdown,
+                server,
+                closed_rx,
+            }
+        }
+
+        async fn dial(
+            &self,
+        ) -> tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        > {
+            tokio_tungstenite::connect_async(format!("ws://{}/live", self.address))
+                .await
+                .unwrap()
+                .0
+        }
+
+        async fn stop(self) {
+            self.shutdown.cancel();
+            self.server.await.expect("HTTP server exits");
+        }
+    }
+
+    #[cfg(unix)]
+    type LiveTestClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Reads until a full frame whose content holds `needle`.
+    #[cfg(unix)]
+    async fn wait_for_frame_with(client: &mut LiveTestClient, needle: &str) {
+        let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let message = client
+                    .next()
+                    .await
+                    .expect("websocket stays open until the frame arrives")
+                    .expect("websocket message");
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["type"] == "frame"
+                        && value["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains(needle))
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        outcome.unwrap_or_else(|_| panic!("no frame containing {needle:?}"));
+    }
+
+    /// The close code and reason of the next Close frame, or None when the stream ends or
+    /// stays silent for `within`.
+    #[cfg(unix)]
+    async fn next_close_frame(
+        client: &mut LiveTestClient,
+        within: Duration,
+    ) -> Option<(u16, String)> {
+        tokio::time::timeout(within, async {
+            loop {
+                match client.next().await? {
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(Some(frame))) => {
+                        return Some((u16::from(frame.code), frame.reason.to_string()));
+                    }
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(None)) | Err(_) => {
+                        return None;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(None)
+    }
+
+    #[cfg(unix)]
+    fn new_live_test_session(name: &str, marker: &str) {
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                "40",
+                "-y",
+                "6",
+                &format!("printf '{marker}'; exec cat"),
+            ])
+            .output()
+            .expect("create pane");
+        assert!(
+            output.status.success(),
+            "tmux new-session: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn kill_live_test_session(name: &str) {
+        let output = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", name])
+            .output()
+            .expect("kill session");
+        assert!(output.status.success(), "tmux kill-session failed");
+    }
+
+    // The session's tmux going away (a stop, a kill) used to end only the capture task: the
+    // socket stayed open and silent, so the page never redialed. The close tells it to.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_live_socket_closes_with_try_again_when_its_tmux_session_is_gone() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::test_helpers::require_tmux!();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (label, transport) in [
+            ("snapshot", LiveTransport::Snapshot),
+            ("grid", LiveTransport::Grid),
+        ] {
+            let pane = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_ws_gone");
+            new_live_test_session(pane.name(), "ALIVE-BEFORE");
+            runtime.block_on(async {
+                let mut server = LiveTestServer::start(pane.name(), transport).await;
+                let mut client = server.dial().await;
+                wait_for_frame_with(&mut client, "ALIVE-BEFORE").await;
+
+                kill_live_test_session(pane.name());
+
+                // The client stays connected the whole time: the handler must end by itself.
+                let close = next_close_frame(&mut client, Duration::from_secs(5)).await;
+                assert_eq!(
+                    close,
+                    Some((CLOSE_CODE_TRY_AGAIN_LATER, "tmux_gone".to_string())),
+                    "{label}: a session that vanished closes the socket with 1013 tmux_gone"
+                );
+                let ended =
+                    tokio::time::timeout(Duration::from_secs(5), server.closed_rx.recv()).await;
+                assert!(
+                    matches!(ended, Ok(Some(()))),
+                    "{label}: the handler ends without the client leaving"
+                );
+                drop(client);
+                server.stop().await;
+            });
+        }
+    }
+
+    // After the close the page redials; once the session is back the new socket serves the new
+    // pane, not the vanished one.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_redial_after_the_tmux_session_is_recreated_shows_the_new_pane() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::test_helpers::require_tmux!();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (label, transport) in [
+            ("snapshot", LiveTransport::Snapshot),
+            ("grid", LiveTransport::Grid),
+        ] {
+            let pane = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_ws_back");
+            new_live_test_session(pane.name(), "FIRST-LAUNCH");
+            runtime.block_on(async {
+                let mut server = LiveTestServer::start(pane.name(), transport).await;
+                let mut client = server.dial().await;
+                wait_for_frame_with(&mut client, "FIRST-LAUNCH").await;
+
+                kill_live_test_session(pane.name());
+                let close = next_close_frame(&mut client, Duration::from_secs(5)).await;
+                assert_eq!(
+                    close.map(|(code, _)| code),
+                    Some(CLOSE_CODE_TRY_AGAIN_LATER),
+                    "{label}: the old socket is told to redial"
+                );
+                let ended =
+                    tokio::time::timeout(Duration::from_secs(5), server.closed_rx.recv()).await;
+                assert!(matches!(ended, Ok(Some(()))), "{label}: the handler ends");
+                drop(client);
+
+                new_live_test_session(pane.name(), "SECOND-LAUNCH");
+                let mut redial = server.dial().await;
+                wait_for_frame_with(&mut redial, "SECOND-LAUNCH").await;
+                drop(redial);
+                server.stop().await;
+            });
+        }
     }
 }
