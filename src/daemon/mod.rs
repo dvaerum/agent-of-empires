@@ -305,6 +305,8 @@ fn public_creation_failure(body: &str, local_owner: bool) -> String {
             | "create_outcome_unknown"
             | "creation_cancelled"
             | "creation_trust_changed"
+            | "fork_unsupported"
+            | "fork_invalid"
     );
     if !public && !local_owner {
         return "Session creation refused; inspect the Daemon log".to_owned();
@@ -1561,6 +1563,20 @@ mod tests {
             assert!(rendered.contains(stage), "{rendered}");
             assert!(rendered.contains("creation-ref"), "{rendered}");
         }
+    }
+
+    #[test]
+    fn creation_failure_shows_the_invalid_fork_reason_remotely() {
+        let refusal = r#"{"error":"fork_invalid","message":"Cannot fork session 'parent': the new session must use the same tool, view and agent as the source."}"#;
+        let rendered = public_creation_failure(refusal, false);
+        assert!(rendered.contains("Cannot fork session 'parent'"));
+    }
+
+    #[test]
+    fn creation_failure_shows_the_fork_refusal_reason_remotely() {
+        let refusal = r#"{"error":"fork_unsupported","message":"Nothing to fork: session 'parent' has no single captured conversation to fork from."}"#;
+        let rendered = public_creation_failure(refusal, false);
+        assert!(rendered.contains("Nothing to fork: session 'parent'"));
     }
 
     #[tokio::test]
