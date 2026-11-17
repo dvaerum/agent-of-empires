@@ -359,6 +359,25 @@ pub(crate) fn unset_claude_auth_routes() -> EnvGuard {
     EnvGuard::unset(crate::session::sandbox_login::claude::OTHER_AUTH_ROUTES)
 }
 
+/// An opencode session store under `dir` that holds `sid` (or nothing), laid out
+/// like opencode 2.x: the id lives only in `session_v2`. Point `OPENCODE_DB` at
+/// the returned path.
+pub(crate) fn opencode_store_holding(dir: &Path, sid: Option<&str>) -> PathBuf {
+    let db_path = dir.join("opencode.db");
+    let seed = sid
+        .map(|sid| format!("INSERT INTO session_v2 VALUES ('{sid}', NULL, '/p');"))
+        .unwrap_or_default();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL);
+             CREATE TABLE session_v2 (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL);
+             {seed}"
+        ))
+        .unwrap();
+    db_path
+}
+
 pub(crate) fn isolate_app_dir() -> AppDirGuard {
     // Private Unix sockets must fit Darwin's sockaddr_un even when TMPDIR is long.
     let temp_home = TempDir::new_in("/tmp").expect("create tempdir for AppDirGuard");

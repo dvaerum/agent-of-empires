@@ -44,11 +44,11 @@ fn internal_error(message: &'static str) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
 }
 
-/// How a structured-view spawn seeds its transcript when the view is enabled.
-struct StructuredSeed {
-    stored_acp_session_id: Option<String>,
-    seed_history_replay: bool,
-    import_terminal: bool,
+/// How a structured-view spawn seeds its transcript.
+pub(crate) struct StructuredSeed {
+    pub(crate) stored_acp_session_id: Option<String>,
+    pub(crate) seed_history_replay: bool,
+    pub(crate) import_terminal: bool,
 }
 
 /// Whether the agent's resumable transcript for `session_id` is present in its
@@ -137,6 +137,47 @@ fn resolve_structured_seed(
     }
 }
 
+/// The seed every launch of a structured worker uses, so the enable path, the
+/// reconciler and a prompt wake cannot disagree about which conversation a row
+/// resumes: a worker admitted by whichever of them gets there first must carry
+/// the conversation, not start a fresh one. `selected_sid` is the claude
+/// conversation picked at the switch; it outranks the row's `agent_session_id`.
+pub(crate) fn structured_seed_for(
+    instance: &Instance,
+    agent_name: &str,
+    selected_sid: Option<&str>,
+    claude_store_pin: Option<&crate::session::capture::ClaudeStorePin>,
+) -> StructuredSeed {
+    let resume_sid = selected_sid.or(instance.agent_session_id.as_deref());
+    // An acp id decides the seed alone, so an ordinary resume skips the probe.
+    // The presence probe is per-agent: claude reads `~/.claude/projects/*.jsonl`,
+    // opencode reads its SQLite session store; both fail open (attempt the
+    // load) when the store is unreadable.
+    let transcript_present = instance.acp_session_id.is_none()
+        && (instance.is_sandboxed()
+            || resume_sid
+                .map(|sid| {
+                    host_transcript_present(
+                        &instance.tool,
+                        &instance.project_path,
+                        sid,
+                        &instance.resolved_host_environment(),
+                        claude_store_pin.map(|pin| pin.store.as_path()).or(instance
+                            .declared_agent_config_dir_for(&instance.tool)
+                            .as_deref()),
+                    )
+                })
+                .unwrap_or(false));
+    resolve_structured_seed(
+        &instance.tool,
+        agent_name,
+        instance.acp_session_id.as_deref(),
+        resume_sid,
+        instance.import_pending == Some(true),
+        transcript_present,
+    )
+}
+
 fn adopt_persisted_structured_instance(
     cached: Instance,
     mut persisted: Instance,
@@ -216,6 +257,31 @@ pub async fn acp_enable(
     }
 
     let agent_name = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
+    // The worker slot is taken before the row is published as structured. The
+    // reconciler tick and a prompt wake admit a worker for any structured row
+    // that has none, and they would seed it without the conversation this
+    // switch is about to hand the launch. A refused slot refuses the switch
+    // while nothing is written; a failed commit drops the reservation on return.
+    let prior_conversation = instance.acp_session_id.is_some()
+        || instance.agent_session_id.is_some()
+        || selected_conversation.is_some();
+    let reservation = match state
+        .acp_supervisor
+        .reserve_spawn(
+            &id,
+            // Only labels the start; the seed itself is resolved at launch.
+            if prior_conversation {
+                crate::acp::supervisor::ResumeKind::Spawn
+            } else {
+                crate::acp::supervisor::ResumeKind::SpawnFirst
+            },
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => return supervisor_error_response("enable structured view", &error),
+    };
     if let Err(resp) =
         commit_structured_view(&state, &mut instance, selected_binding.as_ref(), namespace).await
     {
@@ -228,7 +294,13 @@ pub async fn acp_enable(
         agent = %agent_name,
         "view switched"
     );
-    spawn_enabled_worker(state.clone(), instance, agent_name, selected_conversation);
+    spawn_enabled_worker(
+        state.clone(),
+        instance,
+        agent_name,
+        selected_conversation,
+        reservation,
+    );
     view_response(&state, id, View::Structured).await
 }
 
@@ -339,10 +411,10 @@ async fn commit_structured_view(
 /// container pull. Failures surface as a startup-error banner.
 fn spawn_enabled_worker(
     state: Arc<AppState>,
-
     expected: Instance,
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
+    reservation: crate::acp::supervisor::ResumeReservation,
 ) {
     let session_id = expected.id.clone();
     let work = state.runtime.work.clone();
@@ -361,6 +433,7 @@ fn spawn_enabled_worker(
             agent_name.clone(),
             selected_conversation,
             exclusion,
+            reservation,
         )
         .await
         {
@@ -389,13 +462,15 @@ fn spawn_enabled_worker(
 
 /// Built from the live row under the transition lock, since a provider switch
 /// may commit while the enable waits. `None` once the session left the
-/// structured view.
+/// structured view. Every early return drops `reservation`, which frees the
+/// slot the enable took before it committed the switch.
 async fn deferred_enable_request(
     state: &Arc<AppState>,
     expected: &Instance,
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
     exclusion: crate::acp::sandbox::LaunchExclusion,
+    reservation: crate::acp::supervisor::ResumeReservation,
 ) -> Option<Result<(SpawnRequest, crate::acp::supervisor::ResumeReservation), String>> {
     let session_id = expected.id.as_str();
     let mut instance = find_instance(state, session_id).await.filter(|row| {
@@ -435,37 +510,11 @@ async fn deferred_enable_request(
         }
     }
     let claude_store_pin = instance.selected_claude_store_pin();
-    let resume_sid = selected_conversation
-        .as_ref()
-        .map(|(sid, _)| sid.as_str())
-        .or(instance.agent_session_id.as_deref());
-    // The presence probe is per-agent: claude reads
-    // `~/.claude/projects/*.jsonl`, opencode reads its SQLite session store;
-    // both fail open (attempt the load) when the store is unreadable.
-    let transcript_present = instance.is_sandboxed()
-        || resume_sid
-            .map(|sid| {
-                host_transcript_present(
-                    &instance.tool,
-                    &instance.project_path,
-                    sid,
-                    &instance.resolved_host_environment(),
-                    claude_store_pin
-                        .as_ref()
-                        .map(|pin| pin.store.as_path())
-                        .or(instance
-                            .declared_agent_config_dir_for(&instance.tool)
-                            .as_deref()),
-                )
-            })
-            .unwrap_or(false);
-    let seed = resolve_structured_seed(
-        &instance.tool,
+    let seed = structured_seed_for(
+        &instance,
         &agent_name,
-        instance.acp_session_id.as_deref(),
-        resume_sid,
-        instance.import_pending == Some(true),
-        transcript_present,
+        selected_conversation.as_ref().map(|(sid, _)| sid.as_str()),
+        claude_store_pin.as_ref(),
     );
     let (native, exclusion) = match launch_store_for(state, &instance, exclusion).await {
         Ok(store) => store,
@@ -492,22 +541,6 @@ async fn deferred_enable_request(
             }
             return Some(Err(format!("container start failed: {e}")));
         }
-    };
-    let reservation = match state
-        .acp_supervisor
-        .reserve_spawn(
-            session_id,
-            if seed.stored_acp_session_id.is_some() {
-                crate::acp::supervisor::ResumeKind::Spawn
-            } else {
-                crate::acp::supervisor::ResumeKind::SpawnFirst
-            },
-            crate::process::worker_registry::ResumeAuthority::Explicit,
-        )
-        .await
-    {
-        Ok(reservation) => reservation,
-        Err(error) => return Some(Err(error.to_string())),
     };
     drop(exclusion);
     Some(Ok((
@@ -3853,11 +3886,18 @@ mod tests {
                 crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &row.id, true)
                     .await
                     .unwrap();
-            let (request, reservation) =
-                deferred_enable_request(&state, &working, "claude".into(), None, exclusion)
-                    .await
-                    .expect("fresh enable target")
-                    .unwrap();
+            let reservation = enable_reservation(&state, &row.id).await;
+            let (request, reservation) = deferred_enable_request(
+                &state,
+                &working,
+                "claude".into(),
+                None,
+                exclusion,
+                reservation,
+            )
+            .await
+            .expect("fresh enable target")
+            .unwrap();
             assert!(state
                 .acp_supervisor
                 .spawn_inner(request, reservation)
@@ -3876,11 +3916,19 @@ mod tests {
                 crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &row.id, true)
                     .await
                     .unwrap();
-            assert!(
-                deferred_enable_request(&state, &working, "claude".into(), None, exclusion)
-                    .await
-                    .is_none()
-            );
+            let reservation = enable_reservation(&state, &row.id).await;
+            assert!(deferred_enable_request(
+                &state,
+                &working,
+                "claude".into(),
+                None,
+                exclusion,
+                reservation
+            )
+            .await
+            .is_none());
+            // A refused enable gives its slot back.
+            drop(enable_reservation(&state, &row.id).await);
             let retained = storage.load().unwrap().remove(0);
             assert_eq!(retained.lifecycle_generation, stopped.lifecycle_generation);
             assert_eq!(retained.status, Status::Stopped);
@@ -3928,16 +3976,23 @@ mod tests {
                 .await
                 .unwrap();
 
-        let message =
-            match deferred_enable_request(&state, &inst, "claude".to_string(), None, exclusion)
-                .await
-            {
-                Some(Err(message)) => message,
-                other => panic!(
-                    "expected a startup error, got {:?}",
-                    other.map(|r| r.is_ok())
-                ),
-            };
+        let reservation = enable_reservation(&state, &id).await;
+        let message = match deferred_enable_request(
+            &state,
+            &inst,
+            "claude".to_string(),
+            None,
+            exclusion,
+            reservation,
+        )
+        .await
+        {
+            Some(Err(message)) => message,
+            other => panic!(
+                "expected a startup error, got {:?}",
+                other.map(|r| r.is_ok())
+            ),
+        };
         assert_eq!(
             message,
             crate::session::test_support::login_required("claude").to_string()
@@ -3981,7 +4036,14 @@ mod tests {
 
         let inst_lock = state.instance_lock(&id).await;
         let guard = inst_lock.lock().await;
-        spawn_enabled_worker(state.clone(), inst.clone(), "claude".to_string(), None);
+        let reservation = enable_reservation(&state, &id).await;
+        spawn_enabled_worker(
+            state.clone(),
+            inst.clone(),
+            "claude".to_string(),
+            None,
+            reservation,
+        );
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let (store, ()) = crate::server::session_store::NativeSessionStore::open_for_launch(
             state.clone(),
@@ -5370,5 +5432,247 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// The slot `acp_enable` takes before it commits the switch.
+    async fn enable_reservation(
+        state: &Arc<AppState>,
+        id: &str,
+    ) -> crate::acp::supervisor::ResumeReservation {
+        state
+            .acp_supervisor
+            .reserve_spawn(
+                id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+            .expect("slot is free")
+    }
+
+    /// A terminal opencode row whose conversation the structured view must carry.
+    fn terminal_opencode_row(project: &str, sid: &str) -> Instance {
+        let mut row = Instance::new("switch", project);
+        row.source_profile = "default".into();
+        row.view = View::Terminal;
+        row.tool = "opencode".into();
+        row.agent_name = Some("opencode".into());
+        row.agent_session_id = Some(sid.into());
+        row
+    }
+
+    /// App state for `row`, seeded on disk, whose launcher reports the stored
+    /// id of every launch it is asked to make, then refuses it.
+    async fn enable_state(
+        row: &Instance,
+    ) -> (
+        Arc<AppState>,
+        tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+    ) {
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let (tx, seeds) = tokio::sync::mpsc::unbounded_channel();
+        let launcher: crate::acp::supervisor::Launcher = Arc::new(move |config, _id| {
+            let _ = tx.send(config.stored_acp_session_id);
+            Box::pin(async {
+                Err(crate::acp::acp_client::AcpError::Spawn(
+                    "test launcher".into(),
+                ))
+            })
+        });
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row.clone()],
+            launcher,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        (state, seeds)
+    }
+
+    /// The reconciler's 2 s tick (or a prompt wake) admits a worker the moment
+    /// it sees a structured row with none. The enable must already hold that
+    /// slot by then, or the resume wins the race and spawns without the
+    /// conversation the switch exists to keep.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enable_holds_the_worker_slot_before_the_structured_row_is_visible() {
+        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use crate::process::worker_registry::ResumeAuthority;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let store = tempfile::tempdir().unwrap();
+        let db =
+            crate::session::test_support::opencode_store_holding(store.path(), Some("ses_kept"));
+        let _env = crate::session::test_support::EnvGuard::set(&[("OPENCODE_DB", &db)]);
+        let project = tempfile::tempdir().unwrap();
+        let row = terminal_opencode_row(project.path().to_str().unwrap(), "ses_kept");
+        let (state, mut seeds) = enable_state(&row).await;
+
+        let resume = tokio::spawn({
+            let state = state.clone();
+            let id = row.id.clone();
+            async move {
+                while !find_instance(&state, &id)
+                    .await
+                    .is_some_and(|row| row.is_structured())
+                {
+                    tokio::task::yield_now().await;
+                }
+                matches!(
+                    state
+                        .acp_supervisor
+                        .begin_resume(&id, ResumeKind::SpawnFirst, ResumeAuthority::Automatic)
+                        .await,
+                    Ok(ResumeReservationOutcome::AlreadyPresent)
+                )
+            }
+        });
+        let response = acp_enable(State(state.clone()), Path(row.id.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), resume)
+                .await
+                .expect("the resume saw the structured row")
+                .unwrap(),
+            "a resume admitted a worker for the freshly structured row before the enable did"
+        );
+        // The enable's own launch carries the conversation.
+        let seed = tokio::time::timeout(std::time::Duration::from_secs(10), seeds.recv())
+            .await
+            .expect("the enable launched a worker")
+            .expect("launcher alive");
+        assert_eq!(seed.as_deref(), Some("ses_kept"));
+    }
+
+    /// Enable launches exactly one worker, seeded from the conversation the
+    /// terminal kept, and nothing reports that another worker held the slot.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enable_launches_one_seeded_worker_without_a_slot_conflict() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let store = tempfile::tempdir().unwrap();
+        let db =
+            crate::session::test_support::opencode_store_holding(store.path(), Some("ses_kept"));
+        let _env = crate::session::test_support::EnvGuard::set(&[("OPENCODE_DB", &db)]);
+        let project = tempfile::tempdir().unwrap();
+        let row = terminal_opencode_row(project.path().to_str().unwrap(), "ses_kept");
+        let (state, mut seeds) = enable_state(&row).await;
+
+        let response = acp_enable(State(state.clone()), Path(row.id.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seed = tokio::time::timeout(std::time::Duration::from_secs(10), seeds.recv())
+            .await
+            .expect("the enable launched a worker")
+            .expect("launcher alive");
+        assert_eq!(seed.as_deref(), Some("ses_kept"));
+        // The launcher's refusal is the one startup error; wait for it, then
+        // check nothing else was reported and no second launch followed.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let errors = loop {
+            let errors: Vec<String> = state
+                .acp_event_store
+                .replay_from(&row.id, 0)
+                .into_iter()
+                .filter_map(|(_, event)| match event {
+                    crate::acp::Event::AgentStartupError { message, .. } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            if !errors.is_empty() || tokio::time::Instant::now() > deadline {
+                break errors;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            errors.iter().all(|e| !e.contains("already has a running")),
+            "{errors:?}"
+        );
+        assert!(seeds.try_recv().is_err(), "a second launch was attempted");
+    }
+
+    /// A slot that cannot be reserved refuses the switch before anything is
+    /// written: no structured row, no generation bump.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enable_that_cannot_reserve_a_slot_leaves_the_terminal_row_alone() {
+        use crate::acp::supervisor::ResumeKind;
+        use crate::process::worker_registry::ResumeAuthority;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let row = terminal_opencode_row(project.path().to_str().unwrap(), "ses_kept");
+        let (state, mut seeds) = enable_state(&row).await;
+        let held = state
+            .acp_supervisor
+            .reserve_spawn(&row.id, ResumeKind::SpawnFirst, ResumeAuthority::Explicit)
+            .await
+            .unwrap();
+
+        let response = acp_enable(State(state.clone()), Path(row.id.clone()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let stored = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(stored.view, View::Terminal);
+        assert_eq!(stored.lifecycle_generation, row.lifecycle_generation);
+        assert!(!find_instance(&state, &row.id)
+            .await
+            .unwrap()
+            .is_structured());
+        assert!(seeds.try_recv().is_err(), "no worker may launch");
+        drop(held);
+    }
+
+    /// A switch that fails after it reserved the slot gives the slot back and
+    /// leaves the row as it was.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_switch_releases_the_slot_it_reserved() {
+        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use crate::process::worker_registry::ResumeAuthority;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let row = terminal_opencode_row(project.path().to_str().unwrap(), "ses_kept");
+        // The row on disk moved on after the cached copy was read, so the
+        // commit refuses it as superseded.
+        let mut persisted = row.clone();
+        persisted.lifecycle_generation += 1;
+        let (state, mut seeds) = enable_state(&row).await;
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![persisted.clone()],
+        );
+
+        let response = acp_enable(State(state.clone()), Path(row.id.clone()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            state.acp_supervisor.worker_state(&row.id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+        let stored = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(stored.view, View::Terminal);
+        assert_eq!(stored.lifecycle_generation, persisted.lifecycle_generation);
+        assert!(seeds.try_recv().is_err(), "no worker may launch");
+        // The slot is free again.
+        let next = state
+            .acp_supervisor
+            .begin_resume(&row.id, ResumeKind::SpawnFirst, ResumeAuthority::Explicit)
+            .await
+            .unwrap();
+        assert!(matches!(next, ResumeReservationOutcome::Reserved(_)));
     }
 }

@@ -34,7 +34,8 @@ pub use acp::{
     spawn_acp, switch_acp_agent, switch_acp_provider,
 };
 pub(crate) use acp::{
-    publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
+    publish_startup_error_if_current, recover_pending_terminal_handoffs, structured_seed_for,
+    HandoffRecovery,
 };
 
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
