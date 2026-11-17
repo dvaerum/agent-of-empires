@@ -1583,6 +1583,10 @@ fn perform_deletion_core(
     if container_gone && errors.is_empty() {
         stage_remove_agent_stores(request, config, &mut messages);
     }
+    // A container that is kept still mounts the artifacts and runs in the slice.
+    if errors.is_empty() && (container_gone || !is_sandboxed) {
+        stage_remove_artifacts_and_slice(request, config, &mut messages);
+    }
     crate::hooks::cleanup_hook_status_dir(&request.instance.id);
 
     DeletionResult {
@@ -2430,6 +2434,39 @@ fn stage_remove_agent_stores(
                 "Agent store kept ({error}); `aoe sandbox reclaim` removes it later"
             ));
         }
+    }
+}
+
+/// A permanent purge's last leftovers: the session's artifact directory and its systemd slice,
+/// which nothing else removes.
+///
+/// Reports rather than fails, like the agent-store stage: an error would roll the purge back and
+/// keep a session whose processes are already gone.
+fn stage_remove_artifacts_and_slice(
+    request: &DeletionRequest,
+    config: &crate::session::Config,
+    messages: &mut Vec<String>,
+) {
+    tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "artifacts_remove", "perform_deletion: stage");
+    if let Some(dir) = super::artifacts::artifact_dir_path(&request.session_id) {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => messages.push("Artifacts removed".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(target: "session.delete",
+                    "leaving the artifacts of {}: {error}", request.session_id);
+                messages.push(format!("Artifacts kept ({error})"));
+            }
+        }
+    }
+    if let Err(error) = crate::process::systemd::retire_session_slice(
+        &config.systemd.slice,
+        &request.instance.source_profile,
+        &request.session_id,
+    ) {
+        tracing::warn!(target: "session.delete",
+            "leaving the systemd slice of {}: {error}", request.session_id);
+        messages.push(format!("Systemd slice kept ({error})"));
     }
 }
 
@@ -5489,6 +5526,69 @@ mod tests {
                 "a failed container teardown must retain its mounted scratch files"
             );
             assert!(!result.success);
+        }
+
+        /// A permanent purge takes the session's artifact directory and its systemd slice with
+        /// it, unless a container that mounts the one and runs in the other is still around.
+        #[cfg(unix)]
+        #[test]
+        #[serial_test::serial]
+        fn a_purge_removes_the_artifact_dir_and_stops_the_session_slice() {
+            // (label, sandboxed, delete_sandbox, teardown fails, leftovers are removed)
+            for (label, sandboxed, delete_sandbox, teardown_fails, removed) in [
+                ("terminal", false, true, false, true),
+                ("sandbox removed", true, true, false, true),
+                ("sandbox kept", true, false, false, false),
+                ("teardown failed", true, true, true, false),
+            ] {
+                let temp = tempfile::TempDir::new().unwrap();
+                let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+                crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                    .unwrap();
+                let manager = temp.path().join("manager");
+                std::fs::create_dir(&manager).unwrap();
+                let (_manager, calls) =
+                    crate::process::systemd::slice_manager_fixture::recording(&manager, 0);
+                let mut request = if sandboxed {
+                    sandboxed_request()
+                } else {
+                    test_request(create_test_instance())
+                };
+                request.delete_sandbox = delete_sandbox;
+                request.instance.source_profile = "purgeleftovers".into();
+                let id = request.instance.id.clone();
+                let artifacts = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+                std::fs::write(artifacts.join("shot.png"), b"png").unwrap();
+
+                let result = perform_deletion_with(&request, |_id| {
+                    if teardown_fails {
+                        Teardown::Failed(DockerError::DaemonNotRunning)
+                    } else {
+                        Teardown::Removed
+                    }
+                });
+
+                assert_eq!(
+                    result.success, !teardown_fails,
+                    "{label}: {:?}",
+                    result.errors
+                );
+                assert_eq!(artifacts.exists(), !removed, "{label}");
+                let slice_stop = format!(
+                    "--user stop background-aoe-purgeleftovers-{}.slice\n",
+                    id.replace('-', "_2d")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&calls).unwrap_or_default(),
+                    if removed { slice_stop } else { String::new() },
+                    "{label}"
+                );
+                if removed {
+                    // A re-entrant purge over the already-gone leftovers still succeeds.
+                    let again = perform_deletion_with(&request, |_id| Teardown::AlreadyGone);
+                    assert!(again.success, "{label}: {:?}", again.errors);
+                }
+            }
         }
 
         /// A purge that fails after the container came down is rolled back by

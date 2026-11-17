@@ -848,6 +848,89 @@ pub(crate) fn retire_scope(
     Ok(())
 }
 
+/// Stop the slice a purged session ran in, once its scopes are retired, so the empty unit does
+/// not stay `active` forever. A slice shared with other sessions is left alone.
+pub(crate) fn retire_session_slice(
+    template: &str,
+    profile: &str,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let profile = resolved_profile(profile);
+    let slice = resolve_slice(template, &profile, session_id);
+    // Per-session exactly when the name follows the id; the fallback for an id too long for a
+    // unit name is the shared profile slice and does not.
+    if slice == resolve_slice(template, &profile, &format!("{session_id}x")) {
+        return Ok(());
+    }
+    let Some(systemctl) = slice_manager() else {
+        return Ok(());
+    };
+    let mut command = Command::new(systemctl);
+    command.args(["--user", "stop", &slice]);
+    let output = crate::process::run_with_timeout(&mut command, Duration::from_secs(3))?
+        .ok_or_else(|| anyhow::anyhow!("slice stop timed out"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "slice stop rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+/// `systemctl`, or `None` where there is no systemd and so no slice to stop.
+fn slice_manager() -> Option<PathBuf> {
+    #[cfg(test)]
+    return slice_manager_fixture::systemctl();
+    #[cfg(not(test))]
+    which::which("systemctl").ok()
+}
+
+/// Stands in for `systemctl` on this thread when a purge stops a session slice, which is a no-op
+/// under `cfg(test)` otherwise so a test never touches the real user manager.
+#[cfg(test)]
+pub(crate) mod slice_manager_fixture {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static SYSTEMCTL: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Installed(Option<PathBuf>);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            SYSTEMCTL.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(crate) fn install(systemctl: &Path) -> Installed {
+        Installed(SYSTEMCTL.with(|slot| slot.replace(Some(systemctl.to_owned()))))
+    }
+
+    pub(super) fn systemctl() -> Option<PathBuf> {
+        SYSTEMCTL.with(|slot| slot.borrow().clone())
+    }
+
+    /// A `systemctl` that appends its arguments, one line per call, to the returned `calls` file
+    /// and exits with `code`.
+    pub(crate) fn recording(dir: &Path, code: i32) -> (Installed, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let calls = dir.join("calls");
+        let script = dir.join("systemctl");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit {code}\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (install(&script), calls)
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod legacy_runtime_fixture {
     use std::cell::RefCell;
@@ -1144,6 +1227,39 @@ esac
                 assert!(scope_stopped(id, &scope).unwrap());
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_purged_session_stops_only_a_slice_that_is_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, calls) = slice_manager_fixture::recording(dir.path(), 0);
+        let too_long = "a".repeat(UNIT_NAME_MAX);
+        for (template, id, stopped) in [
+            (
+                DEFAULT_SLICE_TEMPLATE,
+                "sess",
+                Some("background-aoe-main-sess.slice"),
+            ),
+            ("aoe-{session}.slice", "sess", Some("aoe-sess.slice")),
+            // An invalid template falls back to the per-session default.
+            ("bogus", "sess", Some("background-aoe-main-sess.slice")),
+            // Slices the session shares with others are never stopped.
+            ("aoe.slice", "sess", None),
+            (PROFILE_SLICE_TEMPLATE, "sess", None),
+            (DEFAULT_SLICE_TEMPLATE, too_long.as_str(), None),
+        ] {
+            let _ = std::fs::remove_file(&calls);
+            retire_session_slice(template, "main", id).unwrap();
+            let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+            let expected = stopped.map_or(String::new(), |slice| format!("--user stop {slice}\n"));
+            assert_eq!(recorded, expected, "{template} {id}");
+        }
+
+        // A manager that refuses is reported, not swallowed.
+        drop(manager);
+        let (_refusing, _) = slice_manager_fixture::recording(dir.path(), 1);
+        assert!(retire_session_slice(DEFAULT_SLICE_TEMPLATE, "main", "sess").is_err());
     }
 
     #[test]
