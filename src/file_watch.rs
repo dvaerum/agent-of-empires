@@ -675,17 +675,37 @@ async fn dispatcher_loop(
     impl Drop for ExitLatch<'_> {
         fn drop(&mut self) {
             if !self.returned {
-                tracing::error!(
-                    target: "file_watch.service",
-                    origin = %self.origin,
-                    thread = ?std::thread::current().name(),
-                    panicking = std::thread::panicking(),
-                    in_runtime = tokio::runtime::Handle::try_current().is_ok(),
-                    "file watch dispatcher future dropped before run_dispatcher returned"
-                );
+                // A runtime ending under a live service drops the task here; only a panic is a failure.
+                if std::thread::panicking() {
+                    tracing::error!(
+                        target: "file_watch.service",
+                        origin = %self.origin,
+                        thread = ?std::thread::current().name(),
+                        in_runtime = tokio::runtime::Handle::try_current().is_ok(),
+                        "file watch dispatcher future dropped before run_dispatcher returned"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "file_watch.service",
+                        origin = %self.origin,
+                        thread = ?std::thread::current().name(),
+                        in_runtime = tokio::runtime::Handle::try_current().is_ok(),
+                        "file watch dispatcher future dropped before run_dispatcher returned"
+                    );
+                }
             }
-            if let Some(arc) = self.svc.upgrade() {
+            let Some(arc) = self.svc.upgrade() else {
+                return;
+            };
+            if std::thread::panicking() {
                 log_dispatcher_dead_once(&arc, "dispatcher_loop_exit", None);
+            } else if !arc.dispatcher_dead.swap(true, Ordering::AcqRel) {
+                // The task is spawned detached, so only its runtime ending drops it mid-loop:
+                // the process is shutting down, which is no failure.
+                tracing::debug!(
+                    target: "file_watch.service",
+                    "file watch dispatcher stopped with its runtime"
+                );
             }
         }
     }
@@ -1410,6 +1430,70 @@ mod tests {
         log_dispatcher_dead_once(&svc, "second", Some(&"boom"));
         svc.notify_local_change(&path);
         assert!(svc.dispatcher_dead.load(Ordering::Acquire));
+    }
+
+    /// A runtime dropped under a live service, which is how every runner and daemon exits, ends
+    /// the dispatcher without a failure; only a dispatcher dying on its own is an ERROR.
+    #[test]
+    fn dispatcher_dropped_by_runtime_shutdown_is_not_an_error() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Capture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let meta = event.metadata();
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*meta.level(), meta.target().to_owned()));
+            }
+        }
+        let errors_from_file_watch = |events: &Mutex<Vec<(tracing::Level, String)>>| {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(level, target)| {
+                    *level == tracing::Level::ERROR && target == "file_watch.service"
+                })
+                .count()
+        };
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::Registry::default().with(Capture(events.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            // A dispatcher dying for real is still reported, which also proves the capture works.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let dying = rt.block_on(async { FileWatchService::new().expect("init") });
+            log_dispatcher_dead_once(&dying, "channel_closed", None);
+            assert_eq!(errors_from_file_watch(&events), 1);
+
+            // The dispatcher has been polled once, so dropping the runtime drops it mid-loop.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let svc = rt.block_on(async {
+                let svc = FileWatchService::new().expect("init");
+                tokio::task::yield_now().await;
+                svc
+            });
+            drop(rt);
+            assert!(svc.dispatcher_dead.load(Ordering::Acquire));
+            assert_eq!(
+                errors_from_file_watch(&events),
+                1,
+                "runtime shutdown logged an error: {:?}",
+                events.lock().unwrap()
+            );
+        });
     }
 
     #[tokio::test]
