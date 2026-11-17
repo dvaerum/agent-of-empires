@@ -45,6 +45,8 @@ export const BLOCKED_HOLD_MS = 2000;
 const CLAIM_FIT_DEADLINE_MS = 1000;
 /** A claim the Daemon doesn't grant by then brings the strip back. */
 const CLAIMING_TIMEOUT_MS = 5000;
+/** One redial per Starting edge at most this often, so a flapping status cannot storm the server. */
+const REDIAL_COOLDOWN_MS = 3000;
 
 const SURFACES = {
   agent: { wsPath: "live-ws", focusTarget: "agent" as const, dataTerm: "agent" },
@@ -455,6 +457,58 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
       retryEnsure();
     }
   }, [session.id, session.status, sessionActive, paneDead, connected, surface, retryEnsure, readOnly]);
+
+  // A Stop/Start or restart from elsewhere (the CLI, another tab) recreates the pane under this page: the socket is
+  // closed, out of retries (a stop longer than the ~22 s backoff), or still bound to the old pane. The session
+  // reading Starting is the moment the new pane appears, so redial once then. Never on a Stopped, deleted or
+  // read-only view; a socket that already redialed since the pane went away is left alone; a cool-down bounds a
+  // flapping status; an Error -> Starting start is skipped because lifting the error hold already dials afresh.
+  const redialRef = useRef({
+    id: session.id,
+    status: session.status,
+    connected,
+    generation: 0,
+    // The generation current when the pane was last seen to go away; null once a start consumed it.
+    goneAt: null as number | null,
+    redialedAt: -Infinity,
+  });
+  const { reconnecting, retryCount } = live.state;
+  const { maxRetries } = live;
+  /* eslint-disable react-you-might-not-need-an-effect/no-event-handler -- a status edge from the Daemon, not a user event */
+  useEffect(() => {
+    const track = redialRef.current;
+    if (track.id !== session.id) Object.assign(track, { id: session.id, status: session.status, goneAt: null });
+    const from = track.status;
+    track.status = session.status;
+    if (connected && !track.connected) track.generation += 1;
+    // A close, or the session leaving its running states, makes the current socket stale until a newer one opens.
+    if ((!connected && track.connected) || (isSessionActive(from) && !isSessionActive(session.status)))
+      track.goneAt = track.generation;
+    track.connected = connected;
+    if (session.status !== "Starting" || from === "Starting") return;
+    if (from === "Error" || from === "Creating" || from === "Deleting" || from === "Unknown") return;
+    if (surface !== "agent" || readOnly || errorHeld || ensureState !== "ready" || paneDead) return;
+    const redialed = track.goneAt !== null && track.generation > track.goneAt;
+    track.goneAt = null;
+    const stale = connected ? !redialed : reconnecting || retryCount >= maxRetries;
+    if (!stale || Date.now() - track.redialedAt < REDIAL_COOLDOWN_MS) return;
+    track.redialedAt = Date.now();
+    manualReconnect();
+  }, [
+    session.id,
+    session.status,
+    connected,
+    paneDead,
+    reconnecting,
+    retryCount,
+    maxRetries,
+    surface,
+    readOnly,
+    errorHeld,
+    ensureState,
+    manualReconnect,
+  ]);
+  /* eslint-enable react-you-might-not-need-an-effect/no-event-handler */
 
   // Focus/blur MUST be first in the handler so iOS keeps the user-gesture
   // chain and actually shows the keyboard.

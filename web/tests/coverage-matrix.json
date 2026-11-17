@@ -330,6 +330,14 @@
       "notes": "While this tab holds control on a transport with reason pipe_owned, \"Updates are slower.\" shows in the Session's top bar, outside the pane, so it never resizes the terminal; view only, the docked strip adds \"· Updates may lag\" instead. A grid transport, an absent reason, or a newly opened socket clears it. Reconnect redials and sends an explicit claim on the new socket, not claim_if_vacant; a per-pane dismissal persists until a grid transport or a user-initiated reconnect."
     },
     {
+      "id": "terminal.live-redial-on-restart",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/LiveTerminalView.redial.test.tsx"],
+      "components": ["web/src/components/LiveTerminalView.tsx", "web/src/hooks/useLiveTerminal.ts"],
+      "notes": "A Stop/Start or restart from the CLI or another tab redials the held terminal once when the session reads Starting, whether its socket stayed open, closed, or ran out of retries during a long stop. Not while the session stays Stopped, is deleted or created, or in a read-only view; a socket that already redialed, the Restart button's own redial and an Error to Starting start add no dial; a cool-down bounds a flapping status. The server half (a 1013 close when tmux is gone) is covered by Rust tests in src/server/live_ws.rs; no Playwright case drives a real stop yet."
+    },
+    {
       "id": "terminal.live-alt-screen-scroll",
       "kind": "vitest",
       "risk": "high",
