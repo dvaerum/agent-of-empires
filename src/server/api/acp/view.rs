@@ -5675,4 +5675,58 @@ mod tests {
             .unwrap();
         assert!(matches!(next, ResumeReservationOutcome::Reserved(_)));
     }
+
+    /// The user manager can fail one scope status read (it re-executes during a NixOS switch);
+    /// the tmux session is already dead by then, so the enable must ride it out, not abandon
+    /// a terminal row with no session behind it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enable_survives_one_failed_scope_status_read() {
+        use crate::process::worker_registry::ScopeOwnership;
+        use std::os::unix::fs::PermissionsExt;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let store = tempfile::tempdir().unwrap();
+        let db =
+            crate::session::test_support::opencode_store_holding(store.path(), Some("ses_kept"));
+        let _env = crate::session::test_support::EnvGuard::set(&[("OPENCODE_DB", &db)]);
+        let project = tempfile::tempdir().unwrap();
+        let mut row = terminal_opencode_row(project.path().to_str().unwrap(), "ses_kept");
+        row.terminal_scopes = Some(vec![ScopeOwnership::Owned {
+            unit: format!("aoe-session-{}-pane.scope", row.id),
+        }]);
+        let manager = tempfile::tempdir().unwrap();
+        let executable = manager.path().join("systemctl");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+root=${0%/*}
+n=$(( $(cat "$root/shows" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$root/shows"
+if [ "$n" -eq 1 ]; then
+  echo 'Failed to connect to user scope bus' >&2
+  exit 1
+fi
+printf 'LoadState=not-found\nActiveState=inactive\nControlGroup=\n'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::path_prepended(manager.path());
+        let (state, _seeds) = enable_state(&row).await;
+
+        let response = acp_enable(State(state.clone()), Path(row.id.clone()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let shows = std::fs::read_to_string(manager.path().join("shows")).unwrap();
+        assert_eq!(shows.trim(), "2", "the failed read was asked again");
+        let stored = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(stored.view, View::Structured);
+    }
 }

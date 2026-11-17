@@ -662,6 +662,109 @@ pub(crate) fn retire_scopes(
         .iter()
         .try_for_each(|scope| retire_scope(session_id, scope))
 }
+/// How `scope_stopped` re-asks when the user manager cannot answer.
+#[derive(Clone, Copy)]
+struct ScopeProbeRetry {
+    interval: Duration,
+    window: Duration,
+    show_timeout: Duration,
+}
+
+/// The user manager is unreachable for a moment when it re-executes (a NixOS switch does that);
+/// a status read that lands in the gap must not abort a teardown whose tmux is already gone.
+#[cfg_attr(test, allow(dead_code))] // tests use `scope_probe_fixture` instead
+const SCOPE_PROBE_RETRY: ScopeProbeRetry = ScopeProbeRetry {
+    interval: Duration::from_millis(250),
+    window: Duration::from_secs(6),
+    show_timeout: Duration::from_secs(3),
+};
+
+fn scope_probe_retry() -> ScopeProbeRetry {
+    #[cfg(test)]
+    return scope_probe_fixture::current();
+    #[cfg(not(test))]
+    SCOPE_PROBE_RETRY
+}
+
+/// Short retry on this thread so tests that make `systemctl` fail on purpose stay fast; a test
+/// that needs more installs its own.
+#[cfg(test)]
+mod scope_probe_fixture {
+    use super::ScopeProbeRetry;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    const QUICK: ScopeProbeRetry = ScopeProbeRetry {
+        interval: Duration::from_millis(10),
+        window: Duration::from_secs(1),
+        show_timeout: Duration::from_secs(3),
+    };
+
+    thread_local! {
+        static RETRY: Cell<ScopeProbeRetry> = const { Cell::new(QUICK) };
+    }
+
+    pub(super) struct Installed(ScopeProbeRetry);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            RETRY.with(|slot| slot.set(self.0));
+        }
+    }
+
+    pub(super) fn install(retry: ScopeProbeRetry) -> Installed {
+        Installed(RETRY.with(|slot| slot.replace(retry)))
+    }
+
+    pub(super) fn current() -> ScopeProbeRetry {
+        RETRY.with(Cell::get)
+    }
+}
+
+/// `systemctl --user show` for `unit`. A call that times out, or fails without even a `LoadState`
+/// line, means the manager could not answer rather than that it did, so it is repeated until
+/// `retry.window` runs out; any other reply, a refusal included, is returned as it is.
+fn show_scope(unit: &str, retry: ScopeProbeRetry) -> anyhow::Result<std::process::Output> {
+    let systemctl = which::which("systemctl")?;
+    let started = std::time::Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        attempts += 1;
+        let mut command = Command::new(&systemctl);
+        command.args([
+            "--user",
+            "show",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=ControlGroup",
+            unit,
+        ]);
+        let cause = match crate::process::run_with_timeout(&mut command, retry.show_timeout)? {
+            None => format!("timed out after {:?}", retry.show_timeout),
+            Some(output)
+                if output.status.success()
+                    || output
+                        .stdout
+                        .split(|byte| *byte == b'\n')
+                        .any(|line| line.starts_with(b"LoadState=")) =>
+            {
+                return Ok(output);
+            }
+            Some(output) => match String::from_utf8_lossy(&output.stderr).trim() {
+                "" => output.status.to_string(),
+                stderr => stderr.to_string(),
+            },
+        };
+        let elapsed = started.elapsed();
+        anyhow::ensure!(
+            elapsed + retry.interval < retry.window,
+            "scope status unavailable after {attempts} attempts over {:.1}s: {cause}",
+            elapsed.as_secs_f32()
+        );
+        std::thread::sleep(retry.interval);
+    }
+}
+
 /// Prove a captured scope empty without selecting any replacement by SID.
 pub(crate) fn scope_stopped(
     session_id: &str,
@@ -686,17 +789,7 @@ pub(crate) fn scope_stopped(
                     || matches!(byte, b'-' | b'_' | b'.' | b':')),
         "invalid captured scope unit"
     );
-    let mut command = Command::new(which::which("systemctl")?);
-    command.args([
-        "--user",
-        "show",
-        "--property=LoadState",
-        "--property=ActiveState",
-        "--property=ControlGroup",
-        unit,
-    ]);
-    let output = crate::process::run_with_timeout(&mut command, Duration::from_secs(3))?
-        .ok_or_else(|| anyhow::anyhow!("scope status timed out"))?;
+    let output = show_scope(unit, scope_probe_retry())?;
     let text = std::str::from_utf8(&output.stdout)?;
     let property = |name: &str| text.lines().find_map(|line| line.strip_prefix(name));
     let load =
@@ -1225,6 +1318,124 @@ esac
             );
             if succeeds {
                 assert!(scope_stopped(id, &scope).unwrap());
+            }
+        }
+    }
+
+    /// `systemctl show` that misbehaves for its first `bad_calls` calls, then reports the scope
+    /// collected; `shows` counts the calls it received.
+    #[cfg(target_os = "linux")]
+    fn flaky_show_manager(dir: &Path, kind: &str, bad_calls: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = dir.join("systemctl");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+root=${0%/*}
+[ "$2" = show ] || exit 2
+n=$(( $(cat "$root/shows" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$root/shows"
+IFS= read -r kind < "$root/kind"
+IFS= read -r bad < "$root/bad_calls"
+if [ "$n" -le "$bad" ]; then
+  case "$kind" in
+    unreachable) echo 'Failed to connect to user scope bus' >&2; exit 1 ;;
+    hang) exec sleep 5 ;;
+    rejected)
+      printf 'LoadState=loaded\nActiveState=active\nControlGroup=/owned\n'
+      echo 'Access denied' >&2
+      exit 1
+      ;;
+    silent) exit 0 ;;
+  esac
+fi
+printf 'LoadState=not-found\nActiveState=inactive\nControlGroup=\n'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("kind"), format!("{kind}\n")).unwrap();
+        std::fs::write(dir.join("bad_calls"), format!("{bad_calls}\n")).unwrap();
+        let _ = std::fs::remove_file(dir.join("shows"));
+    }
+
+    /// A status read the user manager could not answer is asked again, up to a bound, and the
+    /// error that ends the wait says why; an answer, even a refusal, is never re-asked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn a_scope_status_read_the_manager_cannot_answer_is_retried_within_a_bound() {
+        use crate::process::worker_registry::ScopeOwnership;
+
+        let manager = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::path_prepended(manager.path());
+        let id = "probe-retry";
+        let scope = ScopeOwnership::Owned {
+            unit: format!("{}-original.scope", escaped_id(id)),
+        };
+        let patient = ScopeProbeRetry {
+            interval: Duration::from_millis(5),
+            window: Duration::from_secs(10),
+            show_timeout: Duration::from_millis(300),
+        };
+        let impatient = ScopeProbeRetry {
+            window: Duration::from_millis(200),
+            interval: Duration::from_millis(20),
+            ..patient
+        };
+        for (kind, bad_calls, retry, shows, failure) in [
+            ("unreachable", 3, patient, 4, None),
+            ("hang", 1, patient, 2, None),
+            (
+                "unreachable",
+                u32::MAX,
+                impatient,
+                0,
+                Some("Failed to connect to user scope bus"),
+            ),
+            (
+                "rejected",
+                u32::MAX,
+                patient,
+                1,
+                Some("scope status rejected"),
+            ),
+            (
+                "silent",
+                u32::MAX,
+                patient,
+                1,
+                Some("scope load state unavailable"),
+            ),
+        ] {
+            flaky_show_manager(manager.path(), kind, bad_calls);
+            let _retry = scope_probe_fixture::install(retry);
+            let started = std::time::Instant::now();
+            let result = retire_scope(id, &scope);
+            let seen: u32 = std::fs::read_to_string(manager.path().join("shows"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let label = format!("{kind} x{bad_calls}: {result:?}");
+            match failure {
+                None => assert!(result.is_ok(), "{label}"),
+                Some(text) => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(error.contains(text), "{label}");
+                    if shows == 0 {
+                        // Bounded, and the message counts the attempts that were made.
+                        assert!(started.elapsed() < Duration::from_secs(5), "{label}");
+                        assert!(seen > 1, "{label}");
+                        assert!(
+                            error.contains(&format!("after {seen} attempts")),
+                            "{label}: {error}"
+                        );
+                    }
+                }
+            }
+            if shows != 0 {
+                assert_eq!(seen, shows, "{label}");
             }
         }
     }
