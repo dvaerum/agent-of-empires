@@ -21,7 +21,7 @@ export function switchViewCopy(toStructured: boolean, keepsContext: boolean): Sw
     title: "Switch to terminal",
     confirmLabel: "Switch to terminal",
     body: keepsContext
-      ? "Switch this session back to a tmux terminal? The conversation continues in the terminal (the agent resumes it with `--resume`); the structured view is closed."
+      ? "Switch this session back to a tmux terminal? The conversation continues in the terminal, where the agent resumes the same conversation; the structured view is closed."
       : "Switch this session back to a tmux terminal? The structured conversation is closed; the agent restarts in a fresh terminal pane.",
   };
 }
