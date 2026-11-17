@@ -11,7 +11,7 @@ A manifest carries two independent version axes.
 | `api_version` | The manifest *schema* version. The current schema is `22`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
-Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
+Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested. A plugin-attached per-session MCP layer (`mcp_servers` on `sessions.create` and the `session.mcp.set` RPC, both gated by the high-severity `session.mcp` capability) lets each session carry its own MCP servers (e.g. its own agent-mcp url + bearer token) as the highest-precedence MCP layer; it needs the capability, not a schema version. `api_version >= 22` additionally allows the `sessions` `dynamic_select` option source (host-resolved to the operator's live sessions, `{ value: <id>, label: "<title> (<id>)" }`) and the `password` (masked secret) `SettingType` / `ObjectFieldType`.
 
 ## Top-level fields
 

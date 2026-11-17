@@ -37,6 +37,9 @@ pub enum WidgetKind {
         #[serde(default)]
         mono: bool,
     },
+    /// A secret string, rendered as a masked password input (API v22). Stored
+    /// and validated exactly like [`WidgetKind::Text`]; only the widget differs.
+    Password,
     /// Bounds are advisory; [`ValidationKind`] is the server gate.
     Number {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +87,9 @@ pub enum OptionSource {
     AcpModes,
     Projects,
     Groups,
+    /// The operator's live sessions (API v15); resolved to
+    /// `{ value: <session id>, label: "<title> (<id>)" }`.
+    Sessions,
 }
 
 impl From<aoe_plugin_api::OptionSource> for OptionSource {
@@ -95,6 +101,7 @@ impl From<aoe_plugin_api::OptionSource> for OptionSource {
             A::AcpModes => Self::AcpModes,
             A::Projects => Self::Projects,
             A::Groups => Self::Groups,
+            A::Sessions => Self::Sessions,
         }
     }
 }
@@ -125,6 +132,9 @@ pub enum ObjectFieldWidget {
         #[serde(default)]
         mono: bool,
     },
+    /// A secret string, rendered as a masked password input (API v15). Stored
+    /// and validated exactly like [`ObjectFieldWidget::Text`].
+    Password,
     Number {
         #[serde(skip_serializing_if = "Option::is_none")]
         min: Option<i64>,
